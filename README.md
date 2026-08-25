@@ -28,6 +28,8 @@ boundary precisely.
    ARC tasks and their in-context-query protocol.
 6. [`docs/upstream-map.md`](docs/upstream-map.md) — Python-to-Rust crosswalk and
    intentional differences.
+7. [`docs/tokenizer.md`](docs/tokenizer.md) — the Russian byte-level BPE design,
+   65/30/5 streaming sample, reserved IDs, and reproducible training command.
 
 Every public item is documented, and the dense tensor operations have inline
 shape annotations next to the implementation.
@@ -42,9 +44,23 @@ cargo run --offline
 cargo run --offline --example architecture_walkthrough
 cargo run --offline --example train_tiny_icq -- 10
 cargo run --offline --example train_tiny_bytes -- 10
+cargo run --offline --example tokenizer_roundtrip
 cargo test --offline --all-targets
 cargo doc --offline --no-deps --open
 ```
+
+The pretraining tokenizer has its own data adapter and artifact manifest. A
+dependency-free smoke run is:
+
+```console
+cargo run --release --bin train_tokenizer -- \
+  --smoke-fixture --sample-bytes 1MB --vocab-size 2048 \
+  --output /tmp/bdh-cq-tokenizer.json \
+  --manifest /tmp/bdh-cq-tokenizer.manifest.json
+```
+
+See [`docs/tokenizer.md`](docs/tokenizer.md) before running the real 1GB
+stratified sample against remote FineWeb and the local Ficbook/classics files.
 
 The training examples are mechanics demonstrations, not reproductions of paper
 results. `train_tiny_icq` covers the latent-reasoning objective behind the

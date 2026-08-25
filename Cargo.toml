@@ -10,7 +10,10 @@ categories = ["science"]
 [dependencies]
 burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
 rand = { version = "0.10.0", features = ["std", "std_rng"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 
 [profile.dev]
 # Tensor-heavy debug builds are prohibitively slow with no optimization, while

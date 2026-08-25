@@ -1,0 +1,3 @@
+# Python is only the streaming/Parquet adapter. BPE itself is trained in Rust.
+datasets>=3.2,<5
+pyarrow>=14,<24

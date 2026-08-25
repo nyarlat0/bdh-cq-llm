@@ -156,7 +156,10 @@ version = "0.1.0"
 dependencies = [
  "burn",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
+ "tokenizers",
 ]
 
 [[package]]

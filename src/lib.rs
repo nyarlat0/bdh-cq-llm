@@ -25,6 +25,7 @@ pub mod model;
 pub mod reasoning;
 mod rope;
 pub mod tasks;
+pub mod tokenizer;
 
 pub use error::BdhError;
 pub use model::{
@@ -34,4 +35,7 @@ pub use model::{
 pub use reasoning::{
     GenerateOptions, ReasoningForwardOptions, ReasoningOutput, ReasoningWrapper,
     ReasoningWrapperConfig, Stage,
+};
+pub use tokenizer::{
+    DEFAULT_VOCAB_SIZE, SPECIAL_TOKENS, TokenizerTrainingConfig, train_byte_level_bpe,
 };
