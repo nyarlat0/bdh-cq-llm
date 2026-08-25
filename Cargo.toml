@@ -1,0 +1,21 @@
+[package]
+name = "bdh-cq-llm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A documented Rust/Burn port of lucidrains' public BDH-CQ reconstruction"
+keywords = ["machine-learning", "bdh", "latent-reasoning", "linear-attention"]
+categories = ["science"]
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+rand = { version = "0.10.0", features = ["std", "std_rng"] }
+thiserror = "2.0"
+
+[profile.dev]
+# Tensor-heavy debug builds are prohibitively slow with no optimization, while
+# level 1 still keeps compilation and debugging pleasant.
+opt-level = 1
+
+[profile.release]
+lto = "thin"
