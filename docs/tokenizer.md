@@ -84,9 +84,10 @@ polluting ordinary text statistics.
   columns. A seeded streaming shuffle prevents the tokenizer from seeing only
   the first shards.
 - Local Ficbook Parquet shards are shuffled deterministically and read in
-  bounded PyArrow batches (without converting all 64GB to Arrow). Each
-  `parts[*].clean_text` is emitted with the story title, description, tags and
-  rating; `--ficbook-part-field text` selects the raw alternative. No row is
+  bounded PyArrow batches (without converting all 64GB to Arrow). Only
+  non-empty `parts[*].clean_text` bodies are emitted; story/chapter titles,
+  description, tags and rating do not enter the BPE corpus.
+  `--ficbook-part-field text` selects the raw body alternative. No row is
   excluded because of rating, tags, vocabulary or semantic content.
 - `ru-classic.txt` is read from seeded shuffled 4MiB windows instead of taking
   only the start of the 869MB local file.
@@ -95,6 +96,13 @@ Each emitted sequence is at most 1MiB, preventing a single pathological record
 from becoming a large allocation. It may still contain arbitrary newlines. The
 binary framing protocol carries a source ID and a 64-bit byte length, so no text
 escaping or line-based corruption occurs.
+
+The checked-in `artifacts/tokenizer.json` predates the body-only adapter: its
+Ficbook sample also contained metadata, as recorded by
+`ficbook_metadata_included: true` in its manifest. That only influenced BPE
+merge statistics; the production LM token shards contain bodies only. Running
+the tokenizer command again now uses body-only input and intentionally creates
+a new, checkpoint-incompatible tokenizer version.
 
 ## Train it
 

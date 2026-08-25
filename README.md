@@ -30,6 +30,8 @@ boundary precisely.
    intentional differences.
 7. [`docs/tokenizer.md`](docs/tokenizer.md) — the Russian byte-level BPE design,
    65/30/5 streaming sample, reserved IDs, and reproducible training command.
+8. [`docs/pretraining.md`](docs/pretraining.md) — the exact 1B-token curriculum,
+   packed-data format, RX 6700 XT profile, checkpoints, resume, and operations.
 
 Every public item is documented, and the dense tensor operations have inline
 shape annotations next to the implementation.
@@ -61,6 +63,21 @@ cargo run --release --bin train_tokenizer -- \
 
 See [`docs/tokenizer.md`](docs/tokenizer.md) before running the real 1GB
 stratified sample against remote FineWeb and the local Ficbook/classics files.
+
+The actual Russian pretraining path is separate from the tiny examples:
+
+```console
+cargo run --release --bin pack_pretraining_data -- \
+  --config configs/rx6700.json \
+  --python /tmp/bdh-cq-tokenizer-venv/bin/python
+
+cargo run --release --bin train_llm -- --config configs/rx6700.json
+```
+
+It uses Burn/WGPU over Vulkan (Mesa RADV on the tested RX 6700 XT), automatically
+resumes its latest checkpoint, and follows the 750M general + 250M Ficbook-focus
+curriculum. Read [`docs/pretraining.md`](docs/pretraining.md) before starting a
+multi-day run.
 
 The training examples are mechanics demonstrations, not reproductions of paper
 results. `train_tiny_icq` covers the latent-reasoning objective behind the

@@ -160,26 +160,29 @@ def stream_fineweb(args: argparse.Namespace, writer: FrameWriter) -> None:
     writer.finish_source(0)
 
 
-def ficbook_documents(row: dict, part_field: str) -> Iterator[str]:
+def ficbook_documents(
+    row: dict, part_field: str, include_metadata: bool = False
+) -> Iterator[str]:
     """Turn one Ficbook story into one sequence per chapter/part.
 
-    Metadata is included once, before the first non-empty part. The content is
-    not screened by rating or tags. `clean_text` removes acquisition markup but
-    is not a moderation filter; `--ficbook-part-field text` selects raw text.
+    By default only the part body is emitted. Optional metadata is not used by
+    tokenizer or LM production jobs. No story is screened by its rating/tags;
+    `clean_text` removes acquisition markup but is not a moderation filter.
     """
     metadata: list[str] = []
-    title = row.get("title")
-    description = row.get("description")
-    tags = row.get("tags") or []
-    rating = row.get("rating")
-    if title:
-        metadata.append(str(title))
-    if description:
-        metadata.append(str(description))
-    if tags:
-        metadata.append("Теги: " + ", ".join(map(str, tags)))
-    if rating:
-        metadata.append("Рейтинг: " + str(rating))
+    if include_metadata:
+        title = row.get("title")
+        description = row.get("description")
+        tags = row.get("tags") or []
+        rating = row.get("rating")
+        if title:
+            metadata.append(str(title))
+        if description:
+            metadata.append(str(description))
+        if tags:
+            metadata.append("Теги: " + ", ".join(map(str, tags)))
+        if rating:
+            metadata.append("Рейтинг: " + str(rating))
 
     first = True
     for part in row.get("parts") or []:
@@ -192,9 +195,10 @@ def ficbook_documents(row: dict, part_field: str) -> Iterator[str]:
         if first:
             fields.extend(metadata)
             first = False
-        part_title = part.get("title")
-        if part_title:
-            fields.append(str(part_title))
+        if include_metadata:
+            part_title = part.get("title")
+            if part_title:
+                fields.append(str(part_title))
         fields.append(str(body))
         yield "\n\n".join(fields)
 
@@ -209,12 +213,20 @@ def stream_ficbook(args: argparse.Namespace, writer: FrameWriter) -> None:
     if not files:
         raise RuntimeError(f"no Ficbook Parquet files match {args.ficbook_glob!r}")
     random.Random(args.seed + 1).shuffle(files)
-    columns = ["title", "description", "tags", "rating", "parts"]
+    columns = (
+        ["title", "description", "tags", "rating", "parts"]
+        if args.ficbook_include_metadata
+        else ["parts"]
+    )
     for path in files:
         source = parquet.ParquetFile(path)
         for batch in source.iter_batches(batch_size=64, columns=columns):
             for row in batch.to_pylist():
-                for document in ficbook_documents(row, args.ficbook_part_field):
+                for document in ficbook_documents(
+                    row,
+                    args.ficbook_part_field,
+                    include_metadata=args.ficbook_include_metadata,
+                ):
                     writer.emit(1, document)
                     if writer.done(1):
                         writer.finish_source(1)
@@ -249,7 +261,7 @@ def stream_classics(args: argparse.Namespace, writer: FrameWriter) -> None:
     writer.finish_source(2)
 
 
-def stream_smoke_fixture(writer: FrameWriter) -> None:
+def stream_smoke_fixture(writer: FrameWriter, selected_source: int | None = None) -> None:
     """Dependency-free corpus used by CI and local plumbing checks."""
     fixtures = (
         (
@@ -257,7 +269,7 @@ def stream_smoke_fixture(writer: FrameWriter) -> None:
             "FineWeb также содержит English fragments, code() и emoji 🦔.\n",
         ),
         (
-            "Название фанфика\n\nТеги: романтика, драма\n\nГлава первая. Это фикбук-текст.\n",
+            "Это фикбук-текст: проза первой части без служебной метадаты.\n",
             "Авторская речь, диалог — и разнообразная разговорная лексика.\n",
         ),
         (
@@ -265,7 +277,8 @@ def stream_smoke_fixture(writer: FrameWriter) -> None:
             "Классическая русская проза сохраняет ё, кавычки «ёлочки» и тире.\n",
         ),
     )
-    for source in range(3):
+    sources = range(3) if selected_source is None else (selected_source,)
+    for source in sources:
         for document in itertools.cycle(fixtures[source]):
             writer.emit(source, document)
             if writer.done(source):
@@ -287,9 +300,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ficbook-part-field", choices=("clean_text", "text"), default="clean_text"
     )
+    parser.add_argument(
+        "--ficbook-include-metadata",
+        action="store_true",
+        help="diagnostic opt-in for story/chapter metadata; production omits it",
+    )
     parser.add_argument("--classic-file", default="datasets/ru-classic.txt")
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--smoke-fixture", action="store_true")
+    parser.add_argument(
+        "--source",
+        choices=SOURCE_NAMES,
+        help="stream only one source (used by the exact-token pretraining packer)",
+    )
     return parser.parse_args()
 
 
@@ -297,11 +320,22 @@ def main() -> int:
     args = parse_args()
     if args.sample_bytes <= 0:
         raise ValueError("--sample-bytes must be positive")
-    budgets = split_budget(args.sample_bytes)
+    selected_source = SOURCE_NAMES.index(args.source) if args.source else None
+    budgets = (
+        tuple(args.sample_bytes for _ in SOURCE_NAMES)
+        if selected_source is not None
+        else split_budget(args.sample_bytes)
+    )
     writer = FrameWriter(sys.stdout.buffer, budgets)
     try:
         if args.smoke_fixture:
-            stream_smoke_fixture(writer)
+            stream_smoke_fixture(writer, selected_source)
+        elif selected_source == 0:
+            stream_fineweb(args, writer)
+        elif selected_source == 1:
+            stream_ficbook(args, writer)
+        elif selected_source == 2:
+            stream_classics(args, writer)
         else:
             # Sequential source reads are intentional. BPE accumulates counts,
             # so interleaving does not change its result, and only one remote

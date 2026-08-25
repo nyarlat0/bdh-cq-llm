@@ -240,6 +240,7 @@ struct DataLocations {
     fineweb_revision: String,
     ficbook_glob: String,
     ficbook_part_field: String,
+    ficbook_metadata_included: bool,
     classic_file: String,
 }
 
@@ -385,6 +386,7 @@ fn main() -> Result<(), AnyError> {
             fineweb_revision: args.fineweb_revision.clone(),
             ficbook_glob: args.ficbook_glob.clone(),
             ficbook_part_field: args.ficbook_part_field.clone(),
+            ficbook_metadata_included: false,
             classic_file: args.classic_file.display().to_string(),
         },
         special_token_ids,

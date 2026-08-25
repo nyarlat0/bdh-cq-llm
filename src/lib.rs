@@ -22,6 +22,7 @@
 pub mod error;
 pub mod icq;
 pub mod model;
+pub mod pretrain;
 pub mod reasoning;
 mod rope;
 pub mod tasks;

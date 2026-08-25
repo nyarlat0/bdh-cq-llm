@@ -39,6 +39,7 @@
     "fineweb_revision": "c0c06e94fd3a44ae9e802b2b0fc533817601eb5e",
     "ficbook_glob": "datasets/ficbook/*.parquet",
     "ficbook_part_field": "clean_text",
+    "ficbook_metadata_included": true,
     "classic_file": "datasets/ru-classic.txt"
   },
   "special_token_ids": {

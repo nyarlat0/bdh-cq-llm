@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "tokenizer": "artifacts/tokenizer.json",
+  "packed_dir": "datasets/packed/smoke-v1",
+  "run_dir": "runs/rx6700-gpu-smoke-v2",
+  "seed": 42,
+  "sequence_length": 256,
+  "block_sequences": 8,
+  "sources": {
+    "fineweb2_hq": { "train_tokens": 20000, "validation_tokens": 1024 },
+    "ficbook":     { "train_tokens": 10000, "validation_tokens": 1024 },
+    "ru_classic":  { "train_tokens":  5000, "validation_tokens": 1024 }
+  },
+  "ficbook_phase_one_tokens": 2000,
+  "model": {
+    "dim": 384,
+    "depth": 6,
+    "heads": 4,
+    "dim_qk_heads": 2048
+  },
+  "optimizer": {
+    "micro_batch_size": 1,
+    "gradient_accumulation": 1,
+    "max_learning_rate": 0.0003,
+    "min_learning_rate": 0.00003,
+    "warmup_tokens": 512,
+    "beta_1": 0.9,
+    "beta_2": 0.95,
+    "weight_decay": 0.1,
+    "gradient_clip_norm": 1.0
+  },
+  "checkpoint_every_steps": 10,
+  "validation_every_steps": 10,
+  "validation_batches": 2,
+  "log_every_steps": 1
+}
