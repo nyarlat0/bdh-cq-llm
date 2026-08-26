@@ -133,4 +133,4 @@ memory writes during thought, and the raw-embedding feedback path during
 generation. Random initialization and random task samples are not bitwise
 identical across PyTorch/NumPy and Burn/Rust.
 
-Licensed under MIT; see [`LICENSE`](LICENSE).
+Licensed under [The Unlicense](LICENSE)
