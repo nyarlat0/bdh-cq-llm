@@ -1,18 +1,13 @@
-//! Production-oriented single-GPU pretraining loop for the packed 1B-token run.
+//! Production single-GPU pretraining for the packed Russian corpus.
 //!
-//! This trains the core BDH next-token model.  The latent-reasoning wrapper is
-//! intentionally not enabled during base pretraining: it is a later supervised
-//! or task-specific stage, while all one billion tokens teach the recurrent BDH
-//! block and its associative state ordinary language modelling first.
-//!
-//! The loop targets an RX 6700 XT through Burn's Vulkan backend.  It supports
-//! deterministic block shuffling, gradient accumulation, AdamW, token-based
-//! warmup/cosine decay, held-out loss, checkpoint resume and a graceful `STOP`
-//! file.  Checkpoints are written into a new directory before the atomic
-//! `latest.json` pointer changes; the two newest are retained.
+//! The first curriculum stage can train independent local chunks. After the
+//! configured token threshold, adjacent chunks in the same shuffled work block
+//! share BDH-CQ fast-weight memory. `<|doc|>` starts a new document and resets
+//! that memory. Autograd history is detached independently from memory values,
+//! so documents may be long while truncated BPTT remains bounded.
 
 use bdh_cq_llm::{
-    Bdh, BdhConfig, ModelInput,
+    Bdh, BdhConfig, Memory, ModelInput,
     pretrain::{
         CorpusSource, CurriculumPhase, PackedCorpus, PretrainConfig, TrainingSchedule, hex_digest,
         sha256_file, token_file,
@@ -34,6 +29,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
+    ops::Range,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -42,10 +38,12 @@ use tokenizers::Tokenizer;
 type InferenceBackend = Vulkan<f32, i32>;
 type TrainingBackend = Autodiff<InferenceBackend>;
 type CheckpointRecorder = BinFileRecorder<FullPrecisionSettings>;
+type AnyError = Box<dyn std::error::Error>;
 
 #[derive(Debug)]
 struct Arguments {
     config_path: PathBuf,
+    import_checkpoint: Option<PathBuf>,
     max_steps: Option<u64>,
     device_index: usize,
 }
@@ -63,6 +61,14 @@ struct RunState {
     block_index: usize,
     sequence_in_block: usize,
     best_validation_loss: Option<f32>,
+    #[serde(default)]
+    best_stateful_validation_loss: Option<f32>,
+    #[serde(default)]
+    cq_activation_tokens: Option<u64>,
+    #[serde(default)]
+    document_resets: u64,
+    #[serde(default)]
+    block_resets: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,10 +83,16 @@ struct LogEvent<'a> {
     step: u64,
     tokens_seen: u64,
     phase: CurriculumPhase,
+    mode: &'a str,
     loss: f32,
     learning_rate: f64,
     tokens_per_second: f64,
     elapsed_seconds: f64,
+    memory_tokens: usize,
+    document_resets: u64,
+    block_resets: u64,
+    memory_rms: Option<f32>,
+    memory_abs_max: Option<f32>,
 }
 
 struct TokenLoader {
@@ -96,9 +108,23 @@ struct TokenBatch {
     targets: Vec<i64>,
     batch_size: usize,
     phase: CurriculumPhase,
+    block_started: bool,
+    block_ended: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentSegment {
+    range: Range<usize>,
+    reset_before: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidationMetrics {
+    memoryless: f32,
+    stateful: Option<f32>,
+}
+
+fn main() -> Result<(), AnyError> {
     let arguments = parse_arguments()?;
     let config = PretrainConfig::from_path(&arguments.config_path)?;
     let config_sha256 = hex_digest(&sha256_file(&arguments.config_path)?);
@@ -108,6 +134,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = Tokenizer::from_file(&config.tokenizer)
         .map_err(|error| format!("cannot load tokenizer: {error}"))?;
     let vocabulary = tokenizer.get_vocab_size(true);
+    let document_token = tokenizer
+        .token_to_id("<|doc|>")
+        .ok_or("tokenizer has no <|doc|> token")? as i64;
 
     fs::create_dir_all(&config.run_dir)?;
     freeze_config(&config.run_dir, &arguments.config_path, &config_sha256)?;
@@ -117,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = WgpuDevice::DiscreteGpu(arguments.device_index);
     TrainingBackend::seed(&device, config.seed);
     println!(
-        "initializing Vulkan device {:?}; vocab={}, context={}, effective schedule={} tokens",
+        "initializing Vulkan device {:?}; vocab={}, local context={}, schedule={} tokens",
         device, vocabulary, config.sequence_length, loader.schedule.effective_tokens
     );
     let mut model = BdhConfig::new(vocabulary, config.model.dim)
@@ -136,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let mut state = RunState {
-        format_version: 1,
+        format_version: 2,
         config_sha256: config_sha256.clone(),
         tokenizer_sha256: tokenizer_sha256.clone(),
         packed_corpora_sha256: packed_corpora_sha256.clone(),
@@ -146,121 +175,223 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         block_index: 0,
         sequence_in_block: 0,
         best_validation_loss: None,
+        best_stateful_validation_loss: None,
+        cq_activation_tokens: None,
+        document_resets: 0,
+        block_resets: 0,
     };
+
     if let Some((checkpoint, saved_state)) = latest_checkpoint(&config.run_dir)? {
+        if arguments.import_checkpoint.is_some() {
+            return Err("--import-checkpoint is only valid for an empty run directory".into());
+        }
         validate_resume_state(
             &saved_state,
             &config_sha256,
             &tokenizer_sha256,
             &packed_corpora_sha256,
         )?;
-        let recorder = CheckpointRecorder::default();
-        let model_record = recorder.load(checkpoint.join("model"), &device)?;
-        model = model.load_record(model_record);
-        let optimizer_record = recorder.load(checkpoint.join("optimizer"), &device)?;
-        optimizer = optimizer.load_record(optimizer_record);
+        (model, optimizer) = load_checkpoint(&checkpoint, &device, model, optimizer)?;
         state = saved_state;
         loader.restore(state.block_index, state.sequence_in_block)?;
         println!(
-            "resumed step {} at {} tokens from {}",
+            "resumed CQ run at step {}, {} tokens from {}",
+            state.optimizer_step,
+            state.tokens_seen,
+            checkpoint.display()
+        );
+    } else if let Some(checkpoint) = &arguments.import_checkpoint {
+        let imported = import_state(
+            checkpoint,
+            &config,
+            &config_sha256,
+            &tokenizer_sha256,
+            &packed_corpora_sha256,
+        )?;
+        (model, optimizer) = load_checkpoint(checkpoint, &device, model, optimizer)?;
+        state = imported;
+        loader.restore(state.block_index, state.sequence_in_block)?;
+        println!(
+            "imported base checkpoint step {}, {} tokens from {}",
             state.optimizer_step,
             state.tokens_seen,
             checkpoint.display()
         );
     }
 
-    let stop_at_step = arguments
-        .max_steps
-        .map(|additional| state.optimizer_step.saturating_add(additional));
-    let criterion = CrossEntropyLossConfig::new().init(&device);
+    if config.memory.is_stateful(state.tokens_seen) && state.cq_activation_tokens.is_none() {
+        state.cq_activation_tokens = Some(state.tokens_seen);
+        println!(
+            "stateful CQ activates at imported cursor {} (configured threshold {})",
+            state.tokens_seen, config.memory.stateful_after_tokens
+        );
+    }
+
+    train(
+        model,
+        optimizer,
+        state,
+        loader,
+        &config,
+        vocabulary,
+        document_token,
+        &device,
+        arguments.max_steps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn train<O>(
+    mut model: Bdh<TrainingBackend>,
+    mut optimizer: O,
+    mut state: RunState,
+    mut loader: TokenLoader,
+    config: &PretrainConfig,
+    vocabulary: usize,
+    document_token: i64,
+    device: &WgpuDevice,
+    max_steps: Option<u64>,
+) -> Result<(), AnyError>
+where
+    O: Optimizer<Bdh<TrainingBackend>, TrainingBackend>,
+{
+    let stop_at_step = max_steps.map(|additional| state.optimizer_step.saturating_add(additional));
+    let criterion = CrossEntropyLossConfig::new().init(device);
     let mut accumulator = GradientsAccumulator::new();
-    let mut accumulated = 0_usize;
+    let mut accumulated_chunks = 0_usize;
     let mut accumulated_loss = 0.0_f32;
+    let mut pending_bptt_loss: Option<Tensor<TrainingBackend, 1>> = None;
+    let mut chunks_in_graph = 0_usize;
+    let mut memory: Option<Memory<TrainingBackend>> = None;
     let mut interval_tokens = 0_u64;
     let training_start = Instant::now();
     let mut interval_start = Instant::now();
     let log_path = config.run_dir.join("train.jsonl");
+    let mut stop_pending = false;
+    let mut max_stop_pending = false;
 
     loop {
-        if stop_at_step.is_some_and(|limit| state.optimizer_step >= limit) {
-            checkpoint(&config.run_dir, &model, &optimizer, &state)?;
-            println!("requested --max-steps reached; checkpoint saved");
-            break;
-        }
         let Some(batch) = loader.next_batch(config.optimizer.micro_batch_size)? else {
+            flush_bptt(&model, &mut accumulator, &mut pending_bptt_loss);
             checkpoint(&config.run_dir, &model, &optimizer, &state)?;
             println!("training schedule complete; final checkpoint saved");
             break;
         };
-        let batch_tokens = (batch.batch_size * config.sequence_length) as u64;
-        let inputs = ids_tensor::<TrainingBackend>(
-            batch.inputs,
-            batch.batch_size,
-            config.sequence_length,
-            &device,
-        );
-        let targets = ids_tensor::<TrainingBackend>(
-            batch.targets,
-            batch.batch_size,
-            config.sequence_length,
-            &device,
-        )
-        .reshape([batch.batch_size * config.sequence_length]);
-        let logits = model
-            .forward(ModelInput::TokenIds(inputs), None, Default::default())?
-            .logits
-            .expect("default BDH forward requests logits")
-            .reshape([batch.batch_size * config.sequence_length, vocabulary]);
-        let loss = criterion.forward(logits, targets);
-        let loss_value = loss.clone().to_data().to_vec::<f32>()?[0];
+        let stateful = config.memory.is_stateful(state.tokens_seen);
+        if stateful && state.cq_activation_tokens.is_none() {
+            state.cq_activation_tokens = Some(state.tokens_seen);
+            memory = None;
+            chunks_in_graph = 0;
+            println!("stateful CQ activated at {} tokens", state.tokens_seen);
+        }
+        if stateful && batch.block_started && config.memory.reset_on_work_block {
+            memory = None;
+            chunks_in_graph = 0;
+            state.block_resets += 1;
+        }
+
+        let chunk_loss = if stateful {
+            stateful_chunk_loss(
+                &model,
+                &criterion,
+                &batch,
+                &mut memory,
+                document_token,
+                config.memory.reset_on_document,
+                &mut state.document_resets,
+                vocabulary,
+                device,
+            )?
+        } else {
+            memory = None;
+            memoryless_chunk_loss(&model, &criterion, &batch, vocabulary, device)?
+        };
+        let loss_value = chunk_loss.clone().to_data().to_vec::<f32>()?[0];
         if !loss_value.is_finite() {
             checkpoint(&config.run_dir, &model, &optimizer, &state)?;
             return Err(format!("non-finite loss {loss_value}; emergency checkpoint saved").into());
         }
-        let scaled_loss = loss / config.optimizer.gradient_accumulation as f64;
-        let gradients = GradientsParams::from_grads(scaled_loss.backward(), &model);
-        accumulator.accumulate(&model, gradients);
-        accumulated += 1;
+
+        let scaled = chunk_loss / config.optimizer.gradient_accumulation as f64;
+        pending_bptt_loss = Some(match pending_bptt_loss {
+            Some(previous) => previous + scaled,
+            None => scaled,
+        });
+        accumulated_chunks += batch.batch_size;
         accumulated_loss += loss_value;
+        chunks_in_graph += batch.batch_size;
+        let batch_tokens = (batch.batch_size * config.sequence_length) as u64;
         state.tokens_seen += batch_tokens;
         state.examples_seen += batch.batch_size as u64;
         interval_tokens += batch_tokens;
 
-        if accumulated < config.optimizer.gradient_accumulation {
+        let graph_boundary = !stateful
+            || chunks_in_graph >= config.memory.chunks_per_detach
+            || batch.block_ended
+            || accumulated_chunks == config.optimizer.gradient_accumulation;
+        if graph_boundary {
+            flush_bptt(&model, &mut accumulator, &mut pending_bptt_loss);
+            memory = memory.map(Memory::detach);
+            chunks_in_graph = 0;
+        }
+        if batch.block_ended && config.memory.reset_on_work_block {
+            memory = None;
+        }
+
+        if accumulated_chunks < config.optimizer.gradient_accumulation {
             continue;
         }
 
         let learning_rate =
-            learning_rate(&config, state.tokens_seen, loader.schedule.effective_tokens);
+            learning_rate(config, state.tokens_seen, loader.schedule.effective_tokens);
         model = optimizer.step(learning_rate, model, accumulator.grads());
         state.optimizer_step += 1;
         state.block_index = loader.block_index;
         state.sequence_in_block = loader.sequence_in_block;
-        let mean_loss = accumulated_loss / accumulated as f32;
-        accumulated = 0;
+        let mean_loss = accumulated_loss / accumulated_chunks as f32;
+        accumulated_chunks = 0;
         accumulated_loss = 0.0;
 
         if state.optimizer_step.is_multiple_of(config.log_every_steps) {
             let interval_seconds = interval_start.elapsed().as_secs_f64().max(1e-6);
+            let (memory_rms, memory_abs_max) = memory_statistics(memory.as_ref())?;
+            if memory_rms.is_some_and(|value| !value.is_finite())
+                || memory_abs_max.is_some_and(|value| !value.is_finite())
+            {
+                checkpoint(&config.run_dir, &model, &optimizer, &state)?;
+                return Err("non-finite CQ memory statistic; emergency checkpoint saved".into());
+            }
             let event = LogEvent {
                 event: "train",
                 step: state.optimizer_step,
                 tokens_seen: state.tokens_seen,
                 phase: batch.phase,
+                mode: if stateful {
+                    "stateful_cq"
+                } else {
+                    "memoryless"
+                },
                 loss: mean_loss,
                 learning_rate,
                 tokens_per_second: interval_tokens as f64 / interval_seconds,
                 elapsed_seconds: training_start.elapsed().as_secs_f64(),
+                memory_tokens: memory.as_ref().map_or(0, |value| value.tokens_seen),
+                document_resets: state.document_resets,
+                block_resets: state.block_resets,
+                memory_rms,
+                memory_abs_max,
             };
             append_json_line(&log_path, &event)?;
             println!(
-                "step {:>7} | {:?} | tokens {:>10} | loss {:.5} | lr {:.3e} | {:.0} tok/s",
+                "step {:>7} | {:?} | {} | tokens {:>10} | loss {:.5} | lr {:.3e} | {:.0} tok/s | memory {}",
                 event.step,
                 event.phase,
+                event.mode,
                 event.tokens_seen,
                 event.loss,
                 event.learning_rate,
-                event.tokens_per_second
+                event.tokens_per_second,
+                event.memory_tokens,
             );
             interval_tokens = 0;
             interval_start = Instant::now();
@@ -270,38 +401,209 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .optimizer_step
             .is_multiple_of(config.validation_every_steps)
         {
-            let validation = validate(&model, &mut loader, &config, vocabulary, &device)?;
-            state.best_validation_loss = Some(
-                state
-                    .best_validation_loss
-                    .map_or(validation, |best| best.min(validation)),
-            );
-            println!(
-                "validation at step {}: loss {:.5} (best {:.5})",
-                state.optimizer_step,
-                validation,
+            let validation = validate(
+                &model,
+                &mut loader,
+                config,
+                vocabulary,
+                document_token,
+                device,
+                stateful,
+            )?;
+            let selected = validation.stateful.unwrap_or(validation.memoryless);
+            let best = if stateful {
+                state.best_stateful_validation_loss = Some(
+                    state
+                        .best_stateful_validation_loss
+                        .map_or(selected, |old| old.min(selected)),
+                );
+                state.best_stateful_validation_loss.expect("just assigned")
+            } else {
+                state.best_validation_loss = Some(
+                    state
+                        .best_validation_loss
+                        .map_or(selected, |old| old.min(selected)),
+                );
                 state.best_validation_loss.expect("just assigned")
+            };
+            println!(
+                "validation step {}: memoryless {:.5}, stateful {:?}, best {:.5}",
+                state.optimizer_step, validation.memoryless, validation.stateful, best,
             );
         }
 
-        let stop_requested = config.run_dir.join("STOP").is_file();
-        if state
+        stop_pending |= config.run_dir.join("STOP").is_file();
+        max_stop_pending |= stop_at_step.is_some_and(|limit| state.optimizer_step >= limit);
+        let safe_boundary = !stateful || batch.block_ended;
+        let periodic = state
             .optimizer_step
-            .is_multiple_of(config.checkpoint_every_steps)
-            || stop_requested
-        {
+            .is_multiple_of(config.checkpoint_every_steps);
+        if (periodic || stop_pending || max_stop_pending) && safe_boundary {
             checkpoint(&config.run_dir, &model, &optimizer, &state)?;
-            println!("checkpoint saved at step {}", state.optimizer_step);
-        }
-        if stop_requested {
             println!(
-                "{} detected; stopped cleanly (remove it before resume)",
-                config.run_dir.join("STOP").display()
+                "checkpoint saved at safe block boundary, step {}",
+                state.optimizer_step
             );
+        }
+        if (stop_pending || max_stop_pending) && safe_boundary {
+            if stop_pending {
+                println!(
+                    "{} detected; stopped cleanly (remove it before resume)",
+                    config.run_dir.join("STOP").display()
+                );
+            } else {
+                println!("requested --max-steps reached at a safe block boundary");
+            }
             break;
         }
     }
     Ok(())
+}
+
+fn memoryless_chunk_loss(
+    model: &Bdh<TrainingBackend>,
+    criterion: &burn::nn::loss::CrossEntropyLoss<TrainingBackend>,
+    batch: &TokenBatch,
+    vocabulary: usize,
+    device: &WgpuDevice,
+) -> Result<Tensor<TrainingBackend, 1>, AnyError> {
+    let sequence = batch.inputs.len() / batch.batch_size;
+    let inputs =
+        ids_tensor::<TrainingBackend>(batch.inputs.clone(), batch.batch_size, sequence, device);
+    let targets =
+        ids_tensor::<TrainingBackend>(batch.targets.clone(), batch.batch_size, sequence, device)
+            .reshape([batch.batch_size * sequence]);
+    let logits = model
+        .forward(ModelInput::TokenIds(inputs), None, Default::default())?
+        .logits
+        .expect("default BDH forward requests logits")
+        .reshape([batch.batch_size * sequence, vocabulary]);
+    Ok(criterion.forward(logits, targets))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stateful_chunk_loss(
+    model: &Bdh<TrainingBackend>,
+    criterion: &burn::nn::loss::CrossEntropyLoss<TrainingBackend>,
+    batch: &TokenBatch,
+    memory: &mut Option<Memory<TrainingBackend>>,
+    document_token: i64,
+    reset_on_document: bool,
+    document_resets: &mut u64,
+    vocabulary: usize,
+    device: &WgpuDevice,
+) -> Result<Tensor<TrainingBackend, 1>, AnyError> {
+    debug_assert_eq!(batch.batch_size, 1);
+    let total = batch.inputs.len();
+    let mut combined: Option<Tensor<TrainingBackend, 1>> = None;
+    for segment in document_segments(&batch.inputs, document_token, reset_on_document) {
+        if segment.reset_before {
+            *memory = None;
+            *document_resets += 1;
+        }
+        let length = segment.range.len();
+        let inputs = ids_tensor::<TrainingBackend>(
+            batch.inputs[segment.range.clone()].to_vec(),
+            1,
+            length,
+            device,
+        );
+        let targets = ids_tensor::<TrainingBackend>(
+            batch.targets[segment.range.clone()].to_vec(),
+            1,
+            length,
+            device,
+        )
+        .reshape([length]);
+        let output = model.forward(
+            ModelInput::TokenIds(inputs),
+            memory.take(),
+            Default::default(),
+        )?;
+        let logits = output
+            .logits
+            .expect("default BDH forward requests logits")
+            .reshape([length, vocabulary]);
+        let weighted = criterion.forward(logits, targets) * (length as f64 / total as f64);
+        combined = Some(match combined {
+            Some(previous) => previous + weighted,
+            None => weighted,
+        });
+        *memory = Some(output.memory);
+    }
+    combined.ok_or_else(|| "a training chunk cannot be empty".into())
+}
+
+fn flush_bptt(
+    model: &Bdh<TrainingBackend>,
+    accumulator: &mut GradientsAccumulator<Bdh<TrainingBackend>>,
+    pending: &mut Option<Tensor<TrainingBackend, 1>>,
+) {
+    if let Some(loss) = pending.take() {
+        let gradients = GradientsParams::from_grads(loss.backward(), model);
+        accumulator.accumulate(model, gradients);
+    }
+}
+
+fn document_segments(inputs: &[i64], document_token: i64, reset: bool) -> Vec<DocumentSegment> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    if !reset {
+        return vec![DocumentSegment {
+            range: 0..inputs.len(),
+            reset_before: false,
+        }];
+    }
+    let starts = std::iter::once(0)
+        .chain(
+            inputs
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter_map(|(index, token)| (*token == document_token).then_some(index)),
+        )
+        .collect::<Vec<_>>();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| DocumentSegment {
+            range: *start..starts.get(index + 1).copied().unwrap_or(inputs.len()),
+            reset_before: inputs[*start] == document_token,
+        })
+        .collect()
+}
+
+fn memory_statistics(
+    memory: Option<&Memory<TrainingBackend>>,
+) -> Result<(Option<f32>, Option<f32>), AnyError> {
+    let Some(memory) = memory else {
+        return Ok((None, None));
+    };
+    let mut square_sum = 0.0_f64;
+    let mut elements = 0_usize;
+    let mut abs_max = 0.0_f32;
+    for weight in memory.fast_weights.iter().flatten() {
+        let count = weight.dims().into_iter().product::<usize>();
+        let mean_square = weight
+            .clone()
+            .powf_scalar(2.0)
+            .mean()
+            .to_data()
+            .to_vec::<f32>()?[0];
+        let maximum = weight.clone().abs().max().to_data().to_vec::<f32>()?[0];
+        square_sum += f64::from(mean_square) * count as f64;
+        elements += count;
+        abs_max = abs_max.max(maximum);
+    }
+    if elements == 0 {
+        Ok((None, None))
+    } else {
+        Ok((
+            Some((square_sum / elements as f64).sqrt() as f32),
+            Some(abs_max),
+        ))
+    }
 }
 
 impl TokenLoader {
@@ -344,7 +646,7 @@ impl TokenLoader {
         if block_index < self.schedule.blocks.len()
             && sequence_in_block > self.schedule.blocks[block_index].sequences
         {
-            return Err("checkpoint sequence cursor exceeds its work block".into());
+            return Err("checkpoint sequence cursor exceeds training schedule block".into());
         }
         self.block_index = block_index;
         self.sequence_in_block = sequence_in_block;
@@ -363,17 +665,18 @@ impl TokenLoader {
 
     fn next_batch(&mut self, requested: usize) -> Result<Option<TokenBatch>, String> {
         self.normalize_cursor();
-        let Some(block) = self.schedule.blocks.get(self.block_index).cloned() else {
+        let current_block = self.block_index;
+        let sequence_before = self.sequence_in_block;
+        let Some(block) = self.schedule.blocks.get(current_block).cloned() else {
             return Ok(None);
         };
-        let batch_size = requested.min(block.sequences - self.sequence_in_block);
-        let start = block.token_start + (self.sequence_in_block * self.sequence_length) as u64;
-        let count = batch_size * self.sequence_length + 1;
+        let batch_size = requested.min(block.sequences - sequence_before);
+        let start = block.token_start + (sequence_before * self.sequence_length) as u64;
         let tokens = self
             .corpora
             .get_mut(&block.source)
             .expect("all schedule sources were opened")
-            .read_tokens(start, count)?;
+            .read_tokens(start, batch_size * self.sequence_length + 1)?;
         let mut inputs = Vec::with_capacity(batch_size * self.sequence_length);
         let mut targets = Vec::with_capacity(batch_size * self.sequence_length);
         for sequence in 0..batch_size {
@@ -396,6 +699,8 @@ impl TokenLoader {
             targets,
             batch_size,
             phase: block.phase,
+            block_started: sequence_before == 0,
+            block_ended: self.block_index != current_block,
         }))
     }
 
@@ -409,10 +714,9 @@ impl TokenLoader {
             .corpora
             .get_mut(&source)
             .expect("all validation sources were opened");
-        let available_sequences =
-            (corpus.header.validation_tokens - 1) / self.sequence_length as u64;
-        let first = sequence_index % available_sequences;
-        let batch_size = requested.min((available_sequences - first) as usize);
+        let available = (corpus.header.validation_tokens - 1) / self.sequence_length as u64;
+        let first = sequence_index % available;
+        let batch_size = requested.min((available - first) as usize);
         let start = corpus.header.train_tokens + first * self.sequence_length as u64;
         let tokens = corpus.read_tokens(start, batch_size * self.sequence_length + 1)?;
         let mut inputs = Vec::with_capacity(batch_size * self.sequence_length);
@@ -435,6 +739,8 @@ impl TokenLoader {
             targets,
             batch_size,
             phase: CurriculumPhase::General,
+            block_started: first == 0,
+            block_ended: false,
         })
     }
 }
@@ -444,40 +750,87 @@ fn validate(
     loader: &mut TokenLoader,
     config: &PretrainConfig,
     vocabulary: usize,
+    document_token: i64,
     device: &WgpuDevice,
-) -> Result<f32, Box<dyn std::error::Error>> {
+    stateful: bool,
+) -> Result<ValidationMetrics, AnyError> {
     let inference = model.clone().valid();
     let criterion = CrossEntropyLossConfig::new().init(device);
-    let mut total = 0.0_f32;
+    let mut memoryless_total = 0.0_f32;
+    let mut stateful_total = 0.0_f32;
+    let mut memories: BTreeMap<CorpusSource, Option<Memory<InferenceBackend>>> = BTreeMap::new();
+    for source in CorpusSource::all() {
+        memories.insert(source, None);
+    }
     for index in 0..config.validation_batches {
         let source = CorpusSource::all()[index % 3];
         let sequence_index = (index / 3 * config.optimizer.micro_batch_size) as u64;
         let batch =
             loader.validation_batch(source, sequence_index, config.optimizer.micro_batch_size)?;
-        let inputs = ids_tensor::<InferenceBackend>(
-            batch.inputs,
-            batch.batch_size,
-            config.sequence_length,
-            device,
-        );
-        let targets = ids_tensor::<InferenceBackend>(
-            batch.targets,
-            batch.batch_size,
-            config.sequence_length,
-            device,
-        )
-        .reshape([batch.batch_size * config.sequence_length]);
-        let logits = inference
-            .forward(ModelInput::TokenIds(inputs), None, Default::default())?
-            .logits
-            .expect("default BDH forward requests logits")
-            .reshape([batch.batch_size * config.sequence_length, vocabulary]);
-        total += criterion
-            .forward(logits, targets)
-            .to_data()
-            .to_vec::<f32>()?[0];
+        memoryless_total +=
+            inference_chunk_loss(&inference, &criterion, &batch, None, vocabulary, device)?.0;
+        if stateful {
+            let mut memory = memories.remove(&source).flatten();
+            let mut weighted = 0.0_f32;
+            for segment in document_segments(&batch.inputs, document_token, true) {
+                if segment.reset_before {
+                    memory = None;
+                }
+                let length = segment.range.len();
+                let segment_batch = TokenBatch {
+                    inputs: batch.inputs[segment.range.clone()].to_vec(),
+                    targets: batch.targets[segment.range].to_vec(),
+                    batch_size: 1,
+                    phase: batch.phase,
+                    block_started: false,
+                    block_ended: false,
+                };
+                let (value, next) = inference_chunk_loss(
+                    &inference,
+                    &criterion,
+                    &segment_batch,
+                    memory,
+                    vocabulary,
+                    device,
+                )?;
+                weighted += value * length as f32 / batch.inputs.len() as f32;
+                memory = next;
+            }
+            stateful_total += weighted;
+            memories.insert(source, memory);
+        }
     }
-    Ok(total / config.validation_batches as f32)
+    let divisor = config.validation_batches as f32;
+    Ok(ValidationMetrics {
+        memoryless: memoryless_total / divisor,
+        stateful: stateful.then_some(stateful_total / divisor),
+    })
+}
+
+fn inference_chunk_loss(
+    model: &Bdh<InferenceBackend>,
+    criterion: &burn::nn::loss::CrossEntropyLoss<InferenceBackend>,
+    batch: &TokenBatch,
+    memory: Option<Memory<InferenceBackend>>,
+    vocabulary: usize,
+    device: &WgpuDevice,
+) -> Result<(f32, Option<Memory<InferenceBackend>>), AnyError> {
+    let sequence = batch.inputs.len() / batch.batch_size;
+    let inputs =
+        ids_tensor::<InferenceBackend>(batch.inputs.clone(), batch.batch_size, sequence, device);
+    let targets =
+        ids_tensor::<InferenceBackend>(batch.targets.clone(), batch.batch_size, sequence, device)
+            .reshape([batch.batch_size * sequence]);
+    let output = model.forward(ModelInput::TokenIds(inputs), memory, Default::default())?;
+    let logits = output
+        .logits
+        .expect("default BDH forward requests logits")
+        .reshape([batch.batch_size * sequence, vocabulary]);
+    let value = criterion
+        .forward(logits, targets)
+        .to_data()
+        .to_vec::<f32>()?[0];
+    Ok((value, Some(output.memory)))
 }
 
 fn ids_tensor<B: Backend>(
@@ -506,12 +859,72 @@ fn learning_rate(config: &PretrainConfig, tokens_seen: u64, total_tokens: u64) -
         + (config.optimizer.max_learning_rate - config.optimizer.min_learning_rate) * cosine
 }
 
+fn load_checkpoint<O>(
+    checkpoint: &Path,
+    device: &WgpuDevice,
+    model: Bdh<TrainingBackend>,
+    optimizer: O,
+) -> Result<(Bdh<TrainingBackend>, O), AnyError>
+where
+    O: Optimizer<Bdh<TrainingBackend>, TrainingBackend>,
+{
+    let recorder = CheckpointRecorder::default();
+    let model_record = recorder.load(checkpoint.join("model"), device)?;
+    let model = model.load_record(model_record);
+    let optimizer_record = recorder.load(checkpoint.join("optimizer"), device)?;
+    let optimizer = optimizer.load_record(optimizer_record);
+    Ok((model, optimizer))
+}
+
+fn import_state(
+    checkpoint: &Path,
+    config: &PretrainConfig,
+    config_sha256: &str,
+    tokenizer_sha256: &str,
+    packed_corpora_sha256: &str,
+) -> Result<RunState, AnyError> {
+    let mut state: RunState = serde_json::from_slice(&fs::read(checkpoint.join("state.json"))?)?;
+    if state.format_version != 1 && state.format_version != 2 {
+        return Err(format!(
+            "cannot import checkpoint state version {}",
+            state.format_version
+        )
+        .into());
+    }
+    if state.tokenizer_sha256 != tokenizer_sha256
+        || state.packed_corpora_sha256 != packed_corpora_sha256
+    {
+        return Err("imported checkpoint data/tokenizer fingerprints do not match".into());
+    }
+    let run_dir = checkpoint
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("checkpoint must be RUN/checkpoints/step-N")?;
+    let previous_config_path = run_dir.join("config.json");
+    if hex_digest(&sha256_file(&previous_config_path)?) != state.config_sha256 {
+        return Err("imported checkpoint frozen config hash does not match state".into());
+    }
+    let previous = PretrainConfig::from_path(previous_config_path)?;
+    if !config.continuation_compatible_with(&previous) {
+        return Err("new config changes more than run_dir/memory policy; refusing import".into());
+    }
+    state.format_version = 2;
+    state.config_sha256 = config_sha256.to_owned();
+    state.cq_activation_tokens = config
+        .memory
+        .is_stateful(state.tokens_seen)
+        .then_some(state.tokens_seen);
+    state.document_resets = 0;
+    state.block_resets = 0;
+    Ok(state)
+}
+
 fn checkpoint<O>(
     run_dir: &Path,
     model: &Bdh<TrainingBackend>,
     optimizer: &O,
     state: &RunState,
-) -> Result<(), Box<dyn std::error::Error>>
+) -> Result<(), AnyError>
 where
     O: Optimizer<Bdh<TrainingBackend>, TrainingBackend>,
 {
@@ -532,18 +945,18 @@ where
         fs::remove_dir_all(&final_dir)?;
     }
     fs::rename(&temporary, &final_dir)?;
-    let pointer = LatestPointer {
-        checkpoint_dir: name,
-        optimizer_step: state.optimizer_step,
-    };
-    write_json_atomically(checkpoints.join("latest.json"), &pointer)?;
+    write_json_atomically(
+        checkpoints.join("latest.json"),
+        &LatestPointer {
+            checkpoint_dir: name,
+            optimizer_step: state.optimizer_step,
+        },
+    )?;
     prune_checkpoints(&checkpoints, 2)?;
     Ok(())
 }
 
-fn latest_checkpoint(
-    run_dir: &Path,
-) -> Result<Option<(PathBuf, RunState)>, Box<dyn std::error::Error>> {
+fn latest_checkpoint(run_dir: &Path) -> Result<Option<(PathBuf, RunState)>, AnyError> {
     let checkpoints = run_dir.join("checkpoints");
     let pointer_path = checkpoints.join("latest.json");
     if !pointer_path.is_file() {
@@ -564,9 +977,9 @@ fn validate_resume_state(
     tokenizer_sha256: &str,
     packed_corpora_sha256: &str,
 ) -> Result<(), String> {
-    if state.format_version != 1 {
+    if state.format_version != 2 {
         return Err(format!(
-            "unsupported checkpoint state version {}",
+            "CQ run requires checkpoint state version 2, got {}",
             state.format_version
         ));
     }
@@ -582,13 +995,10 @@ fn validate_resume_state(
     Ok(())
 }
 
-fn packed_corpora_fingerprint(
-    config: &PretrainConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn packed_corpora_fingerprint(config: &PretrainConfig) -> Result<String, AnyError> {
     let mut combined = Sha256::new();
     for source in CorpusSource::all() {
-        let path = token_file(config, source);
-        let digest = sha256_file(&path)?;
+        let digest = sha256_file(token_file(config, source))?;
         combined.update(source.as_str().as_bytes());
         combined.update(digest);
     }
@@ -598,20 +1008,11 @@ fn packed_corpora_fingerprint(
     Ok(fingerprint)
 }
 
-fn freeze_config(
-    run_dir: &Path,
-    source: &Path,
-    expected_sha256: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn freeze_config(run_dir: &Path, source: &Path, expected_sha256: &str) -> Result<(), AnyError> {
     let destination = run_dir.join("config.json");
     if destination.exists() {
-        let actual = hex_digest(&sha256_file(&destination)?);
-        if actual != expected_sha256 {
-            return Err(format!(
-                "{} differs from requested config; choose another run_dir",
-                destination.display()
-            )
-            .into());
+        if hex_digest(&sha256_file(&destination)?) != expected_sha256 {
+            return Err(format!("{} differs from requested config", destination.display()).into());
         }
     } else {
         fs::copy(source, destination)?;
@@ -634,7 +1035,7 @@ fn prune_checkpoints(checkpoints: &Path, keep: usize) -> Result<(), std::io::Err
     Ok(())
 }
 
-fn append_json_line(path: &Path, value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
+fn append_json_line(path: &Path, value: &impl Serialize) -> Result<(), AnyError> {
     let file = OpenOptions::new().create(true).append(true).open(path)?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer(&mut writer, value)?;
@@ -643,7 +1044,7 @@ fn append_json_line(path: &Path, value: &impl Serialize) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
+fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), AnyError> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, value)?;
@@ -653,10 +1054,7 @@ fn write_json(path: PathBuf, value: &impl Serialize) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn write_json_atomically(
-    path: PathBuf,
-    value: &impl Serialize,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn write_json_atomically(path: PathBuf, value: &impl Serialize) -> Result<(), AnyError> {
     let temporary = path.with_extension("json.partial");
     write_json(temporary.clone(), value)?;
     fs::rename(temporary, path)?;
@@ -665,29 +1063,39 @@ fn write_json_atomically(
 
 fn parse_arguments() -> Result<Arguments, String> {
     let mut config_path = PathBuf::from("configs/rx6700.json");
+    let mut import_checkpoint = None;
     let mut max_steps = None;
     let mut device_index = 0;
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--config" => config_path = args.next().ok_or("--config needs a path")?.into(),
+            "--import-checkpoint" => {
+                import_checkpoint = Some(
+                    args.next()
+                        .ok_or("--import-checkpoint needs a path")?
+                        .into(),
+                );
+            }
             "--max-steps" => {
                 max_steps = Some(
                     args.next()
                         .ok_or("--max-steps needs a number")?
                         .parse()
                         .map_err(|error| format!("invalid --max-steps: {error}"))?,
-                )
+                );
             }
             "--device" => {
                 device_index = args
                     .next()
                     .ok_or("--device needs an index")?
                     .parse()
-                    .map_err(|error| format!("invalid --device: {error}"))?
+                    .map_err(|error| format!("invalid --device: {error}"))?;
             }
             "-h" | "--help" => {
-                println!("train_llm [--config PATH] [--device INDEX] [--max-steps N]");
+                println!(
+                    "train_llm [--config PATH] [--import-checkpoint DIR] [--device INDEX] [--max-steps N]"
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?}; use --help")),
@@ -695,7 +1103,57 @@ fn parse_arguments() -> Result<Arguments, String> {
     }
     Ok(Arguments {
         config_path,
+        import_checkpoint,
         max_steps,
         device_index,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_marker_starts_a_reset_segment() {
+        let segments = document_segments(&[10, 11, 3, 20, 3, 30], 3, true);
+        assert_eq!(
+            segments,
+            vec![
+                DocumentSegment {
+                    range: 0..2,
+                    reset_before: false
+                },
+                DocumentSegment {
+                    range: 2..4,
+                    reset_before: true
+                },
+                DocumentSegment {
+                    range: 4..6,
+                    reset_before: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn marker_at_chunk_start_resets_without_empty_segment() {
+        assert_eq!(
+            document_segments(&[3, 10, 11], 3, true),
+            vec![DocumentSegment {
+                range: 0..3,
+                reset_before: true
+            }]
+        );
+    }
+
+    #[test]
+    fn disabled_document_reset_keeps_one_segment() {
+        assert_eq!(
+            document_segments(&[3, 10, 3], 3, false),
+            vec![DocumentSegment {
+                range: 0..3,
+                reset_before: false
+            }]
+        );
+    }
 }

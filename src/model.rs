@@ -38,6 +38,26 @@ pub struct Memory<B: Backend> {
     pub fast_weights: Vec<FastWeight<B>>,
 }
 
+impl<B: Backend> Memory<B> {
+    /// Cut autograd history while preserving the numerical contextual state.
+    ///
+    /// Stateful language-model training carries this value across token
+    /// chunks. Detaching periodically implements truncated BPTT: later chunks
+    /// can still read every accumulated `K^T V` association, while the
+    /// backward graph is bounded independently from the document length.
+    pub fn detach(self) -> Self {
+        Self {
+            tokens_seen: self.tokens_seen,
+            embeds: self.embeds.detach(),
+            fast_weights: self
+                .fast_weights
+                .into_iter()
+                .map(|weight| weight.map(Tensor::detach))
+                .collect(),
+        }
+    }
+}
+
 /// Either discrete token ids or an already-continuous latent workspace.
 ///
 /// This enum makes the Python source's dtype-based branch explicit.  Discrete

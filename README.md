@@ -74,6 +74,20 @@ cargo run --release --bin pack_pretraining_data -- \
 cargo run --release --bin train_llm -- --config configs/rx6700.json
 ```
 
+The production continuation now trains persistent CQ memory without rebuilding
+the packed corpus. It imports the last memoryless checkpoint into a separate,
+rollback-safe run and then carries memory across 256-token chunks with
+1024-token truncated BPTT:
+
+```console
+cargo run --release --bin train_llm -- \
+  --config configs/rx6700-cq.json \
+  --import-checkpoint runs/rx6700-v1/checkpoints/step-000000024000
+```
+
+Subsequent resumes use only `--config configs/rx6700-cq.json`. The trainer
+resets at packed `<|doc|>` markers and shuffled work-block boundaries.
+
 It uses Burn/WGPU over Vulkan (Mesa RADV on the tested RX 6700 XT), automatically
 resumes its latest checkpoint, and follows the 750M general + 250M Ficbook-focus
 curriculum. Read [`docs/pretraining.md`](docs/pretraining.md) before starting a

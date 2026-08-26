@@ -16,6 +16,10 @@
 - после ленивой компиляции kernels короткий synthetic smoke показал примерно
   5.6–7.2k token/s. Это ориентир, не benchmark всего корпуса: скорость чтения,
   validation и checkpoints добавят накладные расходы.
+- stateful CQ с четырьмя связанными chunk (`BPTT=1024`) импортировал настоящий
+  checkpoint на 196.6M токенов, занял около 2.8 GiB VRAM и после Vulkan autotune
+  показал около 4.1k token/s. Первые CQ-шаги нового процесса значительно
+  медленнее из-за компиляции новых `Q·M` kernels.
 
 Smoke проверяет именно те размерности, которые записаны в
 [`configs/rx6700.json`](../configs/rx6700.json), а не только игрушечную модель.
@@ -119,10 +123,26 @@ cargo run --offline --bin pack_pretraining_data -- \
   --config configs/smoke.json --smoke-fixture --force
 ```
 
-## 3. Production-запуск
+## 3. Production-запуск и CQ-переход
 
 ```console
 cargo run --release --bin train_llm -- --config configs/rx6700.json
+```
+
+Первый исторический run обучал независимые окна. Его последний проверенный
+checkpoint импортируется в отдельный stateful run, поэтому исходная rollback
+точка не изменяется:
+
+```console
+cargo run --release --bin train_llm -- \
+  --config configs/rx6700-cq.json \
+  --import-checkpoint runs/rx6700-v1/checkpoints/step-000000024000
+```
+
+После первого CQ-checkpoint `--import-checkpoint` больше не указывается:
+
+```console
+cargo run --release --bin train_llm -- --config configs/rx6700-cq.json
 ```
 
 Основной профиль:
@@ -136,6 +156,33 @@ cargo run --release --bin train_llm -- --config configs/rx6700.json
 - validation и checkpoint каждые 1000 optimizer steps;
 - 64 validation batches на трёх независимых хвостах источников.
 
+[`configs/rx6700-cq.json`](../configs/rx6700-cq.json) сохраняет эти размеры и
+schedule, но после 100M глобальных токенов включает настоящий contextual state.
+При импорте checkpoint уже находится на 196 608 000 токенов, поэтому CQ
+включается сразу. Один work block содержит 256 соседних chunk, то есть до
+65 536 токенов непрерывного stream:
+
+```text
+chunk 0 (256) -> chunk 1 -> chunk 2 -> ... -> chunk 255
+       memory       memory
+```
+
+- fast-weight `Memory` переносится между chunk;
+- autograd-граф переносится через четыре chunk (`BPTT=1024`), затем значения
+  памяти сохраняются, но история отрезается через `Memory::detach()`;
+- `<|doc|>` начинает новый документ и сбрасывает память до обработки маркера;
+- shuffled work blocks не являются соседними по тексту, поэтому между ними
+  также выполняется RESET;
+- если `<|doc|>` находится внутри chunk, trainer делит его на forward-сегменты,
+  но сохраняет все 256 next-token targets и их исходный вес в loss;
+- validation печатает одновременно независимый memoryless loss и stateful loss
+  на последовательных validation chunk.
+
+Таким образом, точный локальный контекст остаётся 256 токенов, direct gradient
+horizon равен 1024, а сжатая CQ-история может охватывать оставшуюся часть
+документа/блока. CQ не является точной KV-cache: порядок и детали далёкого
+текста сжимаются в шесть фиксированных `[B,H,Q,D]` матриц.
+
 Первые итерации одного нового процесса медленнее: Burn лениво компилирует
 Vulkan pipelines для встреченных tensor shapes. Оценка по steady-state smoke
 даёт порядок двух-трёх суток чистого compute на 1B токенов, но реальное время
@@ -148,7 +195,8 @@ Vulkan pipelines для встреченных tensor shapes. Оценка по 
 
 ## Checkpoint, остановка и resume
 
-Trainer пишет:
+Memoryless trainer пишет в `runs/rx6700-v1`, а stateful continuation — в
+`runs/rx6700-cq-v1`. В обоих случаях структура одинакова:
 
 ```text
 runs/rx6700-v1/
@@ -170,17 +218,20 @@ Checkpoint также связан с SHA-256 байтов всех трёх sha
 `latest.json` переключается лишь после полной записи нового checkpoint; хранятся
 два последних checkpoint (примерно 630 MiB суммарно для этого профиля).
 
-Для аккуратной остановки создайте файл:
+Для аккуратной остановки CQ-run создайте файл:
 
 ```console
-touch runs/rx6700-v1/STOP
+touch runs/rx6700-cq-v1/STOP
 ```
 
-Trainer закончит текущий optimizer update, сохранится и выйдет. Перед resume:
+Stateful trainer закончит текущий optimizer update и дойдёт до ближайшей
+границы work block (не более восьми updates), затем сохранится без временной
+memory и выйдет. Поэтому обычный resume воспроизводимо начинается с RESET.
+Перед resume:
 
 ```console
-rm runs/rx6700-v1/STOP
-cargo run --release --bin train_llm -- --config configs/rx6700.json
+rm runs/rx6700-cq-v1/STOP
+cargo run --release --bin train_llm -- --config configs/rx6700-cq.json
 ```
 
 Resume происходит автоматически. `--max-steps N` полезен для проверки: он
@@ -197,10 +248,9 @@ Resume происходит автоматически. `--max-steps N` поле
    gradient accumulation, LR schedule, validation и checkpoint/resume.
 4. [`scripts/stream_tokenizer_corpus.py`](../scripts/stream_tokenizer_corpus.py):
    единственное место, где выбираются поля upstream datasets.
-5. [`src/model.rs`](../src/model.rs): собственно BDH forward и fast-weight
-   memory. При обучении независимых окон `Memory` между batches не переносится;
-   causal interactions внутри окна всё равно вычисляются, а recurrent depth
-   использует один общий набор параметров.
+5. [`src/model.rs`](../src/model.rs): BDH forward, fast-weight memory и
+   `Memory::detach`. В memoryless warm-up окна независимы; в CQ-режиме значения
+   memory переживают detach и передаются следующему chunk.
 
 Base pretraining вызывает `Bdh`, не `ReasoningWrapper`. Это соответствует
 обычному следующему-токену objective и не заставляет модель имитировать

@@ -71,7 +71,7 @@ impl CorpusSource {
 }
 
 /// Requested training and held-out token counts for one source.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceBudget {
     /// Tokens made available to the training schedule.
     pub train_tokens: u64,
@@ -80,7 +80,7 @@ pub struct SourceBudget {
 }
 
 /// BDH dimensions selected for a run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Communication/value width `D`.
     pub dim: usize,
@@ -93,7 +93,7 @@ pub struct ModelConfig {
 }
 
 /// AdamW and batch-scheduling settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OptimizerConfig {
     /// Number of independent sequences passed to one forward call.
     pub micro_batch_size: usize,
@@ -116,7 +116,44 @@ pub struct OptimizerConfig {
 }
 
 /// Complete, serializable contract shared by the packer and trainer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Stateful contextual-memory curriculum used after the language warm-up.
+///
+/// A zero `stateful_after_tokens` enables memory from the beginning.  The
+/// default deliberately disables it so historical configs retain their exact
+/// memoryless behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryTrainingConfig {
+    /// Global token count at which adjacent chunks start sharing CQ memory.
+    pub stateful_after_tokens: u64,
+    /// Number of 256-token chunks kept in one truncated-BPTT graph.
+    pub chunks_per_detach: usize,
+    /// Reset memory whenever the packed `<|doc|>` marker starts a new document.
+    pub reset_on_document: bool,
+    /// Reset at shuffled work-block boundaries, which are not text-contiguous.
+    pub reset_on_work_block: bool,
+}
+
+impl Default for MemoryTrainingConfig {
+    fn default() -> Self {
+        Self {
+            stateful_after_tokens: u64::MAX,
+            chunks_per_detach: 1,
+            reset_on_document: true,
+            reset_on_work_block: true,
+        }
+    }
+}
+
+impl MemoryTrainingConfig {
+    /// Whether the current global token cursor has entered the CQ stage.
+    pub fn is_stateful(&self, tokens_seen: u64) -> bool {
+        tokens_seen >= self.stateful_after_tokens
+    }
+}
+
+/// Complete, serializable contract shared by the packer and trainer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PretrainConfig {
     /// Configuration schema version; currently `1`.
     pub format_version: u32,
@@ -140,6 +177,9 @@ pub struct PretrainConfig {
     pub model: ModelConfig,
     /// Optimizer and batching settings.
     pub optimizer: OptimizerConfig,
+    /// Optional persistent-memory curriculum. Missing means memoryless training.
+    #[serde(default)]
+    pub memory: MemoryTrainingConfig,
     /// Save `latest` model/optimizer/state after this many updates.
     pub checkpoint_every_steps: u64,
     /// Evaluate held-out source ranges after this many updates.
@@ -194,6 +234,22 @@ impl PretrainConfig {
         {
             return Err("block_sequences must be divisible by micro_batch_size".into());
         }
+        if self.memory.chunks_per_detach == 0 {
+            return Err("memory.chunks_per_detach must be non-zero".into());
+        }
+        if self.memory.stateful_after_tokens != u64::MAX && self.optimizer.micro_batch_size != 1 {
+            return Err("stateful CQ training currently requires micro_batch_size = 1".into());
+        }
+        if self.memory.stateful_after_tokens != u64::MAX
+            && !self
+                .optimizer
+                .gradient_accumulation
+                .is_multiple_of(self.memory.chunks_per_detach)
+        {
+            return Err(
+                "gradient_accumulation must be divisible by memory.chunks_per_detach".into(),
+            );
+        }
         if self.model.heads == 0 || !self.model.dim_qk_heads.is_multiple_of(self.model.heads) {
             return Err("dim_qk_heads must be divisible by a non-zero head count".into());
         }
@@ -229,6 +285,28 @@ impl PretrainConfig {
             .try_fold(0_u64, |sum, source| {
                 self.budget(source).map(|budget| sum + budget.train_tokens)
             })
+    }
+
+    /// Check that a checkpoint may continue under a new run contract.
+    ///
+    /// Continuation may change only the output directory and the newly added
+    /// memory policy. Model, optimizer, corpus and deterministic schedule stay
+    /// byte-for-byte compatible at the saved cursor.
+    pub fn continuation_compatible_with(&self, previous: &Self) -> bool {
+        self.format_version == previous.format_version
+            && self.tokenizer == previous.tokenizer
+            && self.packed_dir == previous.packed_dir
+            && self.seed == previous.seed
+            && self.sequence_length == previous.sequence_length
+            && self.block_sequences == previous.block_sequences
+            && self.sources == previous.sources
+            && self.ficbook_phase_one_tokens == previous.ficbook_phase_one_tokens
+            && self.model == previous.model
+            && self.optimizer == previous.optimizer
+            && self.checkpoint_every_steps == previous.checkpoint_every_steps
+            && self.validation_every_steps == previous.validation_every_steps
+            && self.validation_batches == previous.validation_batches
+            && self.log_every_steps == previous.log_every_steps
     }
 }
 
