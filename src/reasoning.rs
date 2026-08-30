@@ -241,6 +241,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                                 collect_per_pass_hiddens: false,
                                 attention_history,
                                 total_reasoning_iterations,
+                                valid_sequence_length: None,
                             },
                         )?;
                         attention_history = output.attention_history;
@@ -276,6 +277,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                             collect_per_pass_hiddens: false,
                             attention_history: None,
                             total_reasoning_iterations: 0,
+                            valid_sequence_length: None,
                         },
                     )?;
                     logits = output.logits;
@@ -297,6 +299,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                             collect_per_pass_hiddens: false,
                             attention_history: None,
                             total_reasoning_iterations: 0,
+                            valid_sequence_length: None,
                         },
                     )?;
                     logits = output.logits;

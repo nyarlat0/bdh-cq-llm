@@ -156,6 +156,17 @@ The block always computes its local write because it is also useful for a
 fresh state; the model decides whether to commit it. Every recurrent depth has
 its own `M_l`, even though all depths share `W_qk`, `W_up`, and `W_out`.
 
+`BdhForwardOptions::valid_sequence_length` supports a physically padded token
+pass. If the physical length is `P` and only the first `N <= P` positions are
+real, the implementation zeros the trailing input embeddings once before the
+shared recurrent block. All block projections are bias-free; zero Q/K gates,
+the causal residual, and the memory read therefore keep that tail zero through
+every depth. Consequently padding contributes exactly zero to `ΔM_l` without
+building a separate mask in each recurrent pass. `Memory.tokens_seen` advances
+by `N`, while logits and `Memory.embeds` retain physical length `P` so the
+caller can keep a bounded set of GPU shapes. The production trainer uses `P` in
+`{16, 32, 64, 128, 256}` and masks padded target labels.
+
 ### 4.5 Recurrent residual
 
 Normally:
@@ -185,9 +196,10 @@ position, feeds it back as a continuous embedding, and runs the model `R`
 times. If latent memory writes are enabled, thinking also modifies `S`; if
 disabled, each iteration can still read `S`, while all `M_l` remain frozen.
 
-`Memory.tokens_seen` advances for both tokens and thought positions. It is the
-offset used by RoPE, so later chunks and latent passes do not reuse position
-zero.
+`Memory.tokens_seen` advances for both real tokens and thought positions. It is
+the offset used by RoPE, so later chunks and latent passes do not reuse
+position zero. Physical padding declared through `valid_sequence_length` does
+not advance this counter.
 
 ## 6. How a stage program executes
 

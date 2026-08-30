@@ -112,6 +112,55 @@ fn chunked_recurrence_matches_one_causal_pass() {
 }
 
 #[test]
+fn padded_tail_does_not_change_real_logits_or_cq_memory() {
+    let device = Default::default();
+    TestBackend::seed(&device, 456);
+    let model = tiny_config().init::<TestBackend>(&device).unwrap();
+    let real_ids = Tensor::from_data(TensorData::new(vec![4_i64, 5, 6], [1, 3]), &device);
+    let mut padded_values = vec![0_i64; 16];
+    padded_values[..3].copy_from_slice(&[4, 5, 6]);
+    let padded_ids = Tensor::from_data(TensorData::new(padded_values, [1, 16]), &device);
+
+    let compact = model
+        .forward(ModelInput::TokenIds(real_ids), None, Default::default())
+        .unwrap();
+    let padded = model
+        .forward(
+            ModelInput::TokenIds(padded_ids),
+            None,
+            BdhForwardOptions {
+                valid_sequence_length: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    assert_eq!(compact.memory.tokens_seen, 3);
+    assert_eq!(padded.memory.tokens_seen, 3);
+    assert_eq!(padded.memory.embeds.dims(), [1, 16, 32]);
+    padded
+        .logits
+        .unwrap()
+        .slice([0..1, 0..3, 0..16])
+        .into_data()
+        .assert_approx_eq::<f32>(
+            &compact.logits.unwrap().into_data(),
+            Tolerance::absolute(1e-5),
+        );
+    for (compact_state, padded_state) in compact
+        .memory
+        .fast_weights
+        .into_iter()
+        .zip(padded.memory.fast_weights)
+    {
+        padded_state.unwrap().into_data().assert_approx_eq::<f32>(
+            &compact_state.unwrap().into_data(),
+            Tolerance::absolute(1e-5),
+        );
+    }
+}
+
+#[test]
 fn wrapper_interleaves_tokens_and_latent_iterations() {
     let device = Default::default();
     let wrapper = ReasoningWrapperConfig::new()

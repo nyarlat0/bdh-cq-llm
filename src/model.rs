@@ -88,6 +88,16 @@ pub struct BdhForwardOptions<B: Backend> {
     /// Total latent iterations in the current wrapper call; used only by the
     /// optional distance-to-the-end bias.
     pub total_reasoning_iterations: usize,
+    /// Number of leading positions that contain real tokens.
+    ///
+    /// The remaining positions, when any, are shape-stabilizing padding. They
+    /// still flow through the fixed-size local computation, but are excluded
+    /// from the associative `K^T V` write and from the rotary-position cursor.
+    /// This is primarily useful to keep a streaming trainer's GPU shape set
+    /// bounded when document boundaries split a physical chunk. The returned
+    /// logits and [`Memory::embeds`] retain the physical padded length; callers
+    /// must mask padded labels or ignore those trailing positions.
+    pub valid_sequence_length: Option<usize>,
 }
 
 impl<B: Backend> Default for BdhForwardOptions<B> {
@@ -98,6 +108,7 @@ impl<B: Backend> Default for BdhForwardOptions<B> {
             collect_per_pass_hiddens: false,
             attention_history: None,
             total_reasoning_iterations: 1,
+            valid_sequence_length: None,
         }
     }
 }
@@ -308,6 +319,10 @@ impl<B: Backend> BdhBlock<B> {
         let block_out = layer_norm_no_params(self.proj_out.forward(block_out));
 
         // New write for this chunk: [B,H,Q,N] @ [B,H,N,D] -> [B,H,Q,D].
+        // A physically padded tail was zeroed once before entering the shared
+        // recurrent block. The bias-free projections and residual path keep
+        // those positions exactly zero through every depth, so their K rows
+        // contribute zero here without constructing six separate masks.
         let memory_write = k.transpose().matmul(values_by_head);
         debug_assert_eq!(block_out.dims(), [batch, sequence, dim]);
 
@@ -563,6 +578,27 @@ impl<B: Backend> Bdh<B> {
                 "a model pass cannot contain an empty sequence".into(),
             ));
         }
+        let valid_sequence_length = options.valid_sequence_length.unwrap_or(sequence);
+        if valid_sequence_length == 0 || valid_sequence_length > sequence {
+            return Err(BdhError::InvalidStages(format!(
+                "valid sequence length must be in 1..={sequence}, got {valid_sequence_length}"
+            )));
+        }
+        if valid_sequence_length < sequence {
+            let device = tokens.device();
+            let mask = (0..sequence)
+                .map(|position| {
+                    if position < valid_sequence_length {
+                        1.0_f32
+                    } else {
+                        0.0_f32
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mask =
+                Tensor::<B, 1>::from_floats(mask.as_slice(), &device).reshape([1, sequence, 1]);
+            tokens = tokens * mask;
+        }
 
         let (tokens_seen, previous_weights) = match memory {
             Some(memory) => {
@@ -669,7 +705,7 @@ impl<B: Backend> Bdh<B> {
         Ok(BdhOutput {
             logits,
             memory: Memory {
-                tokens_seen: tokens_seen + sequence,
+                tokens_seen: tokens_seen + valid_sequence_length,
                 embeds: embeddings,
                 fast_weights: next_weights,
             },

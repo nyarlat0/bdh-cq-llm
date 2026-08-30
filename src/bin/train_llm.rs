@@ -7,7 +7,7 @@
 //! so documents may be long while truncated BPTT remains bounded.
 
 use bdh_cq_llm::{
-    Bdh, BdhConfig, Memory, ModelInput,
+    Bdh, BdhConfig, BdhForwardOptions, Memory, ModelInput,
     pretrain::{
         CorpusSource, CurriculumPhase, PackedCorpus, PretrainConfig, TrainingSchedule, hex_digest,
         sha256_file, token_file,
@@ -31,6 +31,7 @@ use std::{
     io::{BufWriter, Write},
     ops::Range,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 use tokenizers::Tokenizer;
@@ -39,6 +40,9 @@ type InferenceBackend = Vulkan<f32, i32>;
 type TrainingBackend = Autodiff<InferenceBackend>;
 type CheckpointRecorder = BinFileRecorder<FullPrecisionSettings>;
 type AnyError = Box<dyn std::error::Error>;
+
+/// Set by the async-signal-safe SIGINT handler and polled between GPU steps.
+static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 struct Arguments {
@@ -69,6 +73,10 @@ struct RunState {
     document_resets: u64,
     #[serde(default)]
     block_resets: u64,
+    /// Extra memory resets made so a checkpoint taken just after a partial
+    /// work-block boundary has exactly reproducible resume semantics.
+    #[serde(default)]
+    checkpoint_resets: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -124,7 +132,73 @@ struct ValidationMetrics {
     stateful: Option<f32>,
 }
 
+/// Remembers boundaries that occur *inside* a gradient-accumulation step.
+///
+/// Packed source blocks are not all multiples of gradient accumulation. A
+/// boundary can therefore occur on microbatch 16 while the optimizer update is
+/// only made on microbatch 32. Looking only at the final microbatch loses that
+/// boundary and was the reason STOP and periodic checkpoints never fired.
+#[derive(Debug, Default)]
+struct CheckpointGate {
+    pending: bool,
+    crossed_block_boundary: bool,
+}
+
+impl CheckpointGate {
+    fn observe_batch(&mut self, block_ended: bool) {
+        self.crossed_block_boundary |= block_ended;
+    }
+
+    fn request(&mut self, requested: bool) {
+        self.pending |= requested;
+    }
+
+    /// Consume one optimizer step and report whether it is safe to save now.
+    fn finish_optimizer_step(&mut self, stateful: bool) -> bool {
+        let save_now = self.pending && (!stateful || self.crossed_block_boundary);
+        self.crossed_block_boundary = false;
+        if save_now {
+            self.pending = false;
+        }
+        save_now
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn handle_sigint(_signal: i32) {
+    INTERRUPT_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
+}
+
+/// Turn the first Ctrl+C into the same graceful request as a `STOP` file.
+///
+/// The handler performs only one lock-free atomic store. Model recording and
+/// all filesystem work remain in the normal training thread.
+#[cfg(unix)]
+fn install_interrupt_handler() -> Result<(), AnyError> {
+    const SIGINT: i32 = 2;
+    const SIG_ERR: usize = usize::MAX;
+    // SAFETY: `handle_sigint` has C signal-handler ABI and remains valid for
+    // the process lifetime. The handler itself only stores an atomic flag.
+    let previous = unsafe { signal(SIGINT, handle_sigint as *const () as usize) };
+    if previous == SIG_ERR {
+        Err("failed to install the SIGINT checkpoint handler".into())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn install_interrupt_handler() -> Result<(), AnyError> {
+    Ok(())
+}
+
 fn main() -> Result<(), AnyError> {
+    install_interrupt_handler()?;
     let arguments = parse_arguments()?;
     let config = PretrainConfig::from_path(&arguments.config_path)?;
     let config_sha256 = hex_digest(&sha256_file(&arguments.config_path)?);
@@ -137,6 +211,9 @@ fn main() -> Result<(), AnyError> {
     let document_token = tokenizer
         .token_to_id("<|doc|>")
         .ok_or("tokenizer has no <|doc|> token")? as i64;
+    let padding_token = tokenizer
+        .token_to_id("<|pad|>")
+        .ok_or("tokenizer has no <|pad|> token")? as i64;
 
     fs::create_dir_all(&config.run_dir)?;
     freeze_config(&config.run_dir, &arguments.config_path, &config_sha256)?;
@@ -179,6 +256,7 @@ fn main() -> Result<(), AnyError> {
         cq_activation_tokens: None,
         document_resets: 0,
         block_resets: 0,
+        checkpoint_resets: 0,
     };
 
     if let Some((checkpoint, saved_state)) = latest_checkpoint(&config.run_dir)? {
@@ -235,6 +313,7 @@ fn main() -> Result<(), AnyError> {
         &config,
         vocabulary,
         document_token,
+        padding_token,
         &device,
         arguments.max_steps,
     )
@@ -249,6 +328,7 @@ fn train<O>(
     config: &PretrainConfig,
     vocabulary: usize,
     document_token: i64,
+    padding_token: i64,
     device: &WgpuDevice,
     max_steps: Option<u64>,
 ) -> Result<(), AnyError>
@@ -257,6 +337,9 @@ where
 {
     let stop_at_step = max_steps.map(|additional| state.optimizer_step.saturating_add(additional));
     let criterion = CrossEntropyLossConfig::new().init(device);
+    let padded_criterion = CrossEntropyLossConfig::new()
+        .with_pad_tokens(Some(vec![padding_token as usize]))
+        .init(device);
     let mut accumulator = GradientsAccumulator::new();
     let mut accumulated_chunks = 0_usize;
     let mut accumulated_loss = 0.0_f32;
@@ -269,6 +352,7 @@ where
     let log_path = config.run_dir.join("train.jsonl");
     let mut stop_pending = false;
     let mut max_stop_pending = false;
+    let mut checkpoint_gate = CheckpointGate::default();
 
     loop {
         let Some(batch) = loader.next_batch(config.optimizer.micro_batch_size)? else {
@@ -293,10 +377,11 @@ where
         let chunk_loss = if stateful {
             stateful_chunk_loss(
                 &model,
-                &criterion,
+                &padded_criterion,
                 &batch,
                 &mut memory,
                 document_token,
+                padding_token,
                 config.memory.reset_on_document,
                 &mut state.document_resets,
                 vocabulary,
@@ -324,6 +409,7 @@ where
         state.tokens_seen += batch_tokens;
         state.examples_seen += batch.batch_size as u64;
         interval_tokens += batch_tokens;
+        checkpoint_gate.observe_batch(batch.block_ended);
 
         let graph_boundary = !stateful
             || chunks_in_graph >= config.memory.chunks_per_detach
@@ -351,6 +437,16 @@ where
         let mean_loss = accumulated_loss / accumulated_chunks as f32;
         accumulated_chunks = 0;
         accumulated_loss = 0.0;
+
+        let stop_requested =
+            config.run_dir.join("STOP").is_file() || INTERRUPT_REQUESTED.load(Ordering::Relaxed);
+        if stop_requested && !stop_pending {
+            println!(
+                "stop requested; waiting for the next safe work-block boundary (at most one block)"
+            );
+        }
+        stop_pending |= stop_requested;
+        max_stop_pending |= stop_at_step.is_some_and(|limit| state.optimizer_step >= limit);
 
         if state.optimizer_step.is_multiple_of(config.log_every_steps) {
             let interval_seconds = interval_start.elapsed().as_secs_f64().max(1e-6);
@@ -400,6 +496,8 @@ where
         if state
             .optimizer_step
             .is_multiple_of(config.validation_every_steps)
+            && !stop_pending
+            && !max_stop_pending
         {
             let validation = validate(
                 &model,
@@ -407,6 +505,7 @@ where
                 config,
                 vocabulary,
                 document_token,
+                padding_token,
                 device,
                 stateful,
             )?;
@@ -432,21 +531,31 @@ where
             );
         }
 
-        stop_pending |= config.run_dir.join("STOP").is_file();
-        max_stop_pending |= stop_at_step.is_some_and(|limit| state.optimizer_step >= limit);
-        let safe_boundary = !stateful || batch.block_ended;
         let periodic = state
             .optimizer_step
             .is_multiple_of(config.checkpoint_every_steps);
-        if (periodic || stop_pending || max_stop_pending) && safe_boundary {
+        checkpoint_gate.request(periodic || stop_pending || max_stop_pending);
+        let safe_boundary = checkpoint_gate.finish_optimizer_step(stateful);
+        if safe_boundary {
+            // A partial source block may already have started later in this
+            // optimizer accumulation. Its Memory cannot be serialized by the
+            // model recorder, so make the reset explicit both now and after
+            // resume. Model/optimizer/corpus cursor remain fully checkpointed.
+            if stateful {
+                memory = None;
+                chunks_in_graph = 0;
+                state.checkpoint_resets += 1;
+            }
             checkpoint(&config.run_dir, &model, &optimizer, &state)?;
             println!(
-                "checkpoint saved at safe block boundary, step {}",
-                state.optimizer_step
+                "checkpoint saved at safe block boundary, step {} ({} tokens)",
+                state.optimizer_step, state.tokens_seen
             );
         }
         if (stop_pending || max_stop_pending) && safe_boundary {
-            if stop_pending {
+            if INTERRUPT_REQUESTED.load(Ordering::Relaxed) {
+                println!("SIGINT handled cleanly after saving the checkpoint");
+            } else if stop_pending {
                 println!(
                     "{} detected; stopped cleanly (remove it before resume)",
                     config.run_dir.join("STOP").display()
@@ -488,6 +597,7 @@ fn stateful_chunk_loss(
     batch: &TokenBatch,
     memory: &mut Option<Memory<TrainingBackend>>,
     document_token: i64,
+    padding_token: i64,
     reset_on_document: bool,
     document_resets: &mut u64,
     vocabulary: usize,
@@ -502,29 +612,28 @@ fn stateful_chunk_loss(
             *document_resets += 1;
         }
         let length = segment.range.len();
-        let inputs = ids_tensor::<TrainingBackend>(
-            batch.inputs[segment.range.clone()].to_vec(),
-            1,
-            length,
-            device,
-        );
-        let targets = ids_tensor::<TrainingBackend>(
-            batch.targets[segment.range.clone()].to_vec(),
-            1,
-            length,
-            device,
-        )
-        .reshape([length]);
+        let physical_length = segment_bucket_length(length, total);
+        let (input_ids, target_ids) =
+            padded_segment_tokens(batch, segment.range, physical_length, padding_token);
+        let inputs = ids_tensor::<TrainingBackend>(input_ids, 1, physical_length, device);
+        let targets = ids_tensor::<TrainingBackend>(target_ids, 1, physical_length, device)
+            .reshape([physical_length]);
         let output = model.forward(
             ModelInput::TokenIds(inputs),
             memory.take(),
-            Default::default(),
+            BdhForwardOptions {
+                valid_sequence_length: Some(length),
+                ..Default::default()
+            },
         )?;
         let logits = output
             .logits
             .expect("default BDH forward requests logits")
-            .reshape([length, vocabulary]);
-        let weighted = criterion.forward(logits, targets) * (length as f64 / total as f64);
+            .reshape([physical_length, vocabulary]);
+        // Burn masks padded labels to zero but averages over the physical
+        // length. Multiplying by physical/total therefore produces exactly
+        // sum(real token losses) / original chunk length.
+        let weighted = criterion.forward(logits, targets) * (physical_length as f64 / total as f64);
         combined = Some(match combined {
             Some(previous) => previous + weighted,
             None => weighted,
@@ -532,6 +641,35 @@ fn stateful_chunk_loss(
         *memory = Some(output.memory);
     }
     combined.ok_or_else(|| "a training chunk cannot be empty".into())
+}
+
+/// Map arbitrary document fragments onto a tiny set of physical GPU shapes.
+///
+/// Production chunks are 256 positions, yielding only
+/// `16, 32, 64, 128, 256`. A non-standard final maximum is retained as one
+/// additional bucket, which keeps tests and alternate configs well-defined.
+fn segment_bucket_length(valid_length: usize, maximum: usize) -> usize {
+    assert!(valid_length > 0 && valid_length <= maximum);
+    [16, 32, 64, 128, 256]
+        .into_iter()
+        .find(|bucket| *bucket >= valid_length && *bucket <= maximum)
+        .unwrap_or(maximum)
+}
+
+/// Copy one real segment and fill only its trailing physical slots with pad.
+fn padded_segment_tokens(
+    batch: &TokenBatch,
+    range: Range<usize>,
+    physical_length: usize,
+    padding_token: i64,
+) -> (Vec<i64>, Vec<i64>) {
+    let valid_length = range.len();
+    debug_assert!(physical_length >= valid_length);
+    let mut inputs = vec![padding_token; physical_length];
+    let mut targets = vec![padding_token; physical_length];
+    inputs[..valid_length].copy_from_slice(&batch.inputs[range.clone()]);
+    targets[..valid_length].copy_from_slice(&batch.targets[range]);
+    (inputs, targets)
 }
 
 fn flush_bptt(
@@ -745,17 +883,22 @@ impl TokenLoader {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate(
     model: &Bdh<TrainingBackend>,
     loader: &mut TokenLoader,
     config: &PretrainConfig,
     vocabulary: usize,
     document_token: i64,
+    padding_token: i64,
     device: &WgpuDevice,
     stateful: bool,
 ) -> Result<ValidationMetrics, AnyError> {
     let inference = model.clone().valid();
     let criterion = CrossEntropyLossConfig::new().init(device);
+    let padded_criterion = CrossEntropyLossConfig::new()
+        .with_pad_tokens(Some(vec![padding_token as usize]))
+        .init(device);
     let mut memoryless_total = 0.0_f32;
     let mut stateful_total = 0.0_f32;
     let mut memories: BTreeMap<CorpusSource, Option<Memory<InferenceBackend>>> = BTreeMap::new();
@@ -767,8 +910,10 @@ fn validate(
         let sequence_index = (index / 3 * config.optimizer.micro_batch_size) as u64;
         let batch =
             loader.validation_batch(source, sequence_index, config.optimizer.micro_batch_size)?;
-        memoryless_total +=
-            inference_chunk_loss(&inference, &criterion, &batch, None, vocabulary, device)?.0;
+        memoryless_total += inference_chunk_loss(
+            &inference, &criterion, &batch, None, None, vocabulary, device,
+        )?
+        .0;
         if stateful {
             let mut memory = memories.remove(&source).flatten();
             let mut weighted = 0.0_f32;
@@ -777,9 +922,12 @@ fn validate(
                     memory = None;
                 }
                 let length = segment.range.len();
+                let physical_length = segment_bucket_length(length, batch.inputs.len());
+                let (inputs, targets) =
+                    padded_segment_tokens(&batch, segment.range, physical_length, padding_token);
                 let segment_batch = TokenBatch {
-                    inputs: batch.inputs[segment.range.clone()].to_vec(),
-                    targets: batch.targets[segment.range].to_vec(),
+                    inputs,
+                    targets,
                     batch_size: 1,
                     phase: batch.phase,
                     block_started: false,
@@ -787,13 +935,14 @@ fn validate(
                 };
                 let (value, next) = inference_chunk_loss(
                     &inference,
-                    &criterion,
+                    &padded_criterion,
                     &segment_batch,
                     memory,
+                    Some(length),
                     vocabulary,
                     device,
                 )?;
-                weighted += value * length as f32 / batch.inputs.len() as f32;
+                weighted += value * physical_length as f32 / batch.inputs.len() as f32;
                 memory = next;
             }
             stateful_total += weighted;
@@ -812,6 +961,7 @@ fn inference_chunk_loss(
     criterion: &burn::nn::loss::CrossEntropyLoss<InferenceBackend>,
     batch: &TokenBatch,
     memory: Option<Memory<InferenceBackend>>,
+    valid_sequence_length: Option<usize>,
     vocabulary: usize,
     device: &WgpuDevice,
 ) -> Result<(f32, Option<Memory<InferenceBackend>>), AnyError> {
@@ -821,7 +971,14 @@ fn inference_chunk_loss(
     let targets =
         ids_tensor::<InferenceBackend>(batch.targets.clone(), batch.batch_size, sequence, device)
             .reshape([batch.batch_size * sequence]);
-    let output = model.forward(ModelInput::TokenIds(inputs), memory, Default::default())?;
+    let output = model.forward(
+        ModelInput::TokenIds(inputs),
+        memory,
+        BdhForwardOptions {
+            valid_sequence_length,
+            ..Default::default()
+        },
+    )?;
     let logits = output
         .logits
         .expect("default BDH forward requests logits")
@@ -1155,5 +1312,41 @@ mod tests {
                 reset_before: false
             }]
         );
+    }
+
+    #[test]
+    fn document_segments_use_only_bounded_gpu_buckets() {
+        assert_eq!(segment_bucket_length(1, 256), 16);
+        assert_eq!(segment_bucket_length(16, 256), 16);
+        assert_eq!(segment_bucket_length(17, 256), 32);
+        assert_eq!(segment_bucket_length(64, 256), 64);
+        assert_eq!(segment_bucket_length(65, 256), 128);
+        assert_eq!(segment_bucket_length(129, 256), 256);
+        assert_eq!(segment_bucket_length(256, 256), 256);
+        assert_eq!(segment_bucket_length(129, 192), 192);
+    }
+
+    #[test]
+    fn checkpoint_gate_remembers_a_boundary_before_the_final_microbatch() {
+        let mut gate = CheckpointGate::default();
+
+        // A request without a boundary must persist into later steps.
+        gate.request(true);
+        assert!(!gate.finish_optimizer_step(true));
+        assert!(gate.pending);
+
+        // The next boundary occurs halfway through an optimizer step. Later
+        // microbatches must not erase it.
+        gate.observe_batch(true);
+        gate.observe_batch(false);
+        assert!(gate.finish_optimizer_step(true));
+        assert!(!gate.pending);
+    }
+
+    #[test]
+    fn memoryless_checkpoint_does_not_wait_for_a_block_boundary() {
+        let mut gate = CheckpointGate::default();
+        gate.request(true);
+        assert!(gate.finish_optimizer_step(false));
     }
 }

@@ -8,7 +8,12 @@ keywords = ["machine-learning", "bdh", "latent-reasoning", "linear-attention"]
 categories = ["science"]
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff", "vulkan", "fusion", "autotune"] }
+# Burn Fusion 0.21 keeps every discovered operation-stream execution plan in
+# an unbounded process-local Vec. Stateful document/BPTT training produces many
+# distinct streams, so the plan search grew for hours while GPU utilization
+# collapsed. Raw Vulkan/CubeCL still uses optimized matmul kernels and
+# shape-bounded autotuning, but avoids that unbounded graph-plan cache.
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff", "vulkan", "autotune"] }
 rand = { version = "0.10.0", features = ["std", "std_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
