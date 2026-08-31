@@ -88,6 +88,18 @@ cargo run --release --bin train_llm -- \
 Subsequent resumes use only `--config configs/rx6700-cq.json`. The trainer
 resets at packed `<|doc|>` markers and shuffled work-block boundaries.
 
+To inspect the latest saved model as pure text completion without loading the
+optimizer or packed corpora:
+
+```console
+cargo run --release --bin complete_llm -- --config configs/rx6700-cq.json
+```
+
+The REPL inserts the trained `<|doc|>` once, then sends exactly the entered text
+and carries CQ memory through generated and user-supplied fragments. It adds no
+role labels or hidden separators and supports `/reset`, `/status`, and `/quit`.
+This is a base-model probe, not a chat-SFT interface.
+
 It uses Burn/WGPU over Vulkan (Mesa RADV on the tested RX 6700 XT), automatically
 resumes its latest checkpoint, and follows the 750M general + 250M Ficbook-focus
 curriculum. Read [`docs/pretraining.md`](docs/pretraining.md) before starting a

@@ -262,6 +262,32 @@ Resume происходит автоматически. `--max-steps N` поле
 дойти до безопасной границы. Другую дискретную карту можно выбрать через
 `--device 1`.
 
+## Интерактивный text completion из checkpoint
+
+Последний атомарно сохранённый checkpoint можно открыть в терминальном REPL:
+
+```console
+cargo run --release --bin complete_llm -- --config configs/rx6700-cq.json
+```
+
+`complete_llm` читает `latest.json`, сверяет hash config и tokenizer, загружает
+только `model.bin` и переводит модель с autodiff на inference backend. Packed
+corpora и два AdamW moment из `optimizer.bin` для этого не нужны. Явный старый
+checkpoint выбирается через `--checkpoint runs/.../step-XXXXXXXXXXXX`.
+
+При старте stream ввод получает единственный обученный `<|doc|>`, после чего
+кодируется с `add_special_tokens=false`. Последующие пользовательские фрагменты
+добавляются к общей CQ-memory буквально: без role labels, пробелов, переводов
+строки или других скрытых разделителей. Если граница нужна, она должна быть
+частью введённого текста. Сгенерированные токены возвращаются в модель как token
+IDs — тем же путём, который обучался next-token objective.
+
+Команда `/reset` очищает CQ-memory и добавляет к следующему вводу новый
+`<|doc|>`. `/status` показывает фактическую длину накопленного потока, `/quit`
+завершает процесс. Сэмплированный `<|doc|>` также заканчивает текущий документ;
+следующий ввод автоматически начнёт новый. Необученные role tokens и остальные
+служебные IDs sampler маскирует.
+
 ## Где читать реализацию
 
 1. [`src/pretrain.rs`](../src/pretrain.rs): config contract, binary header,
@@ -270,9 +296,11 @@ Resume происходит автоматически. `--max-steps N` поле
    framed document protocol, BPE, точная обрезка token quota и manifests.
 3. [`src/bin/train_llm.rs`](../src/bin/train_llm.rs): loader, next-token loss,
    gradient accumulation, LR schedule, validation и checkpoint/resume.
-4. [`scripts/stream_tokenizer_corpus.py`](../scripts/stream_tokenizer_corpus.py):
+4. [`src/bin/complete_llm.rs`](../src/bin/complete_llm.rs): загрузка latest
+   checkpoint, terminal completion, chunked ingestion и autoregressive CQ.
+5. [`scripts/stream_tokenizer_corpus.py`](../scripts/stream_tokenizer_corpus.py):
    единственное место, где выбираются поля upstream datasets.
-5. [`src/model.rs`](../src/model.rs): BDH forward, fast-weight memory и
+6. [`src/model.rs`](../src/model.rs): BDH forward, fast-weight memory и
    `Memory::detach`. В memoryless warm-up окна независимы; в CQ-режиме значения
    memory переживают detach и передаются следующему chunk.
 
