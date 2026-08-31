@@ -126,10 +126,45 @@ struct DocumentSegment {
     reset_before: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
+struct SourceValidationMetrics {
+    memoryless_loss: f32,
+    memoryless_perplexity: f32,
+    memoryless_bits_per_byte: f32,
+    stateful_loss: Option<f32>,
+    stateful_perplexity: Option<f32>,
+    stateful_bits_per_byte: Option<f32>,
+    target_tokens: u64,
+    decoded_utf8_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ValidationMetrics {
     memoryless: f32,
     stateful: Option<f32>,
+    per_source: BTreeMap<CorpusSource, SourceValidationMetrics>,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidationLogEvent<'a> {
+    event: &'a str,
+    step: u64,
+    tokens_seen: u64,
+    mode: &'a str,
+    memoryless_loss: f32,
+    stateful_loss: Option<f32>,
+    selected_loss: f32,
+    best_selected_loss: f32,
+    improved: bool,
+    per_source: &'a BTreeMap<CorpusSource, SourceValidationMetrics>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ValidationAccumulator {
+    memoryless_loss_sum: f64,
+    stateful_loss_sum: f64,
+    target_tokens: u64,
+    decoded_utf8_bytes: u64,
 }
 
 /// Remembers boundaries that occur *inside* a gradient-accumulation step.
@@ -230,6 +265,14 @@ fn main() -> Result<(), AnyError> {
         .with_depth(config.model.depth)
         .with_heads(config.model.heads)
         .with_dim_qk_heads(config.model.dim_qk_heads)
+        .with_rotary_dim(config.model.rotary_dim)
+        .with_tie_embeddings(config.model.tie_embeddings)
+        .with_attn_residual(config.model.attn_residual)
+        .with_attn_residual_tied(config.model.attn_residual_tied)
+        .with_attn_residual_depth_bias_distance(config.model.attn_residual_depth_bias_distance)
+        .with_gated_neuron_state(config.model.gated_neuron_state)
+        .with_cq_memory_decay(config.model.cq_memory_decay)
+        .with_cq_memory_retention(config.model.cq_memory_retention)
         .init::<TrainingBackend>(&device)?;
     println!("model parameters: {}", model.num_params());
     let mut optimizer = AdamWConfig::new()
@@ -242,7 +285,7 @@ fn main() -> Result<(), AnyError> {
         .init();
 
     let mut state = RunState {
-        format_version: 2,
+        format_version: if config.format_version >= 2 { 3 } else { 2 },
         config_sha256: config_sha256.clone(),
         tokenizer_sha256: tokenizer_sha256.clone(),
         packed_corpora_sha256: packed_corpora_sha256.clone(),
@@ -314,6 +357,7 @@ fn main() -> Result<(), AnyError> {
         vocabulary,
         document_token,
         padding_token,
+        &tokenizer,
         &device,
         arguments.max_steps,
     )
@@ -329,6 +373,7 @@ fn train<O>(
     vocabulary: usize,
     document_token: i64,
     padding_token: i64,
+    tokenizer: &Tokenizer,
     device: &WgpuDevice,
     max_steps: Option<u64>,
 ) -> Result<(), AnyError>
@@ -341,17 +386,20 @@ where
         .with_pad_tokens(Some(vec![padding_token as usize]))
         .init(device);
     let mut accumulator = GradientsAccumulator::new();
-    let mut accumulated_chunks = 0_usize;
+    let mut accumulated_micro_batches = 0_usize;
     let mut accumulated_loss = 0.0_f32;
     let mut pending_bptt_loss: Option<Tensor<TrainingBackend, 1>> = None;
     let mut chunks_in_graph = 0_usize;
-    let mut memory: Option<Memory<TrainingBackend>> = None;
+    let mut memories = (0..config.optimizer.micro_batch_size)
+        .map(|_| None)
+        .collect::<Vec<Option<Memory<TrainingBackend>>>>();
     let mut interval_tokens = 0_u64;
     let training_start = Instant::now();
     let mut interval_start = Instant::now();
     let log_path = config.run_dir.join("train.jsonl");
     let mut stop_pending = false;
     let mut max_stop_pending = false;
+    let mut best_checkpoint_pending = false;
     let mut checkpoint_gate = CheckpointGate::default();
 
     loop {
@@ -364,12 +412,12 @@ where
         let stateful = config.memory.is_stateful(state.tokens_seen);
         if stateful && state.cq_activation_tokens.is_none() {
             state.cq_activation_tokens = Some(state.tokens_seen);
-            memory = None;
+            memories.iter_mut().for_each(|memory| *memory = None);
             chunks_in_graph = 0;
             println!("stateful CQ activated at {} tokens", state.tokens_seen);
         }
         if stateful && batch.block_started && config.memory.reset_on_work_block {
-            memory = None;
+            memories.iter_mut().for_each(|memory| *memory = None);
             chunks_in_graph = 0;
             state.block_resets += 1;
         }
@@ -379,7 +427,7 @@ where
                 &model,
                 &padded_criterion,
                 &batch,
-                &mut memory,
+                &mut memories,
                 document_token,
                 padding_token,
                 config.memory.reset_on_document,
@@ -388,7 +436,7 @@ where
                 device,
             )?
         } else {
-            memory = None;
+            memories.iter_mut().for_each(|memory| *memory = None);
             memoryless_chunk_loss(&model, &criterion, &batch, vocabulary, device)?
         };
         let loss_value = chunk_loss.clone().to_data().to_vec::<f32>()?[0];
@@ -402,9 +450,9 @@ where
             Some(previous) => previous + scaled,
             None => scaled,
         });
-        accumulated_chunks += batch.batch_size;
+        accumulated_micro_batches += 1;
         accumulated_loss += loss_value;
-        chunks_in_graph += batch.batch_size;
+        chunks_in_graph += 1;
         let batch_tokens = (batch.batch_size * config.sequence_length) as u64;
         state.tokens_seen += batch_tokens;
         state.examples_seen += batch.batch_size as u64;
@@ -414,28 +462,34 @@ where
         let graph_boundary = !stateful
             || chunks_in_graph >= config.memory.chunks_per_detach
             || batch.block_ended
-            || accumulated_chunks == config.optimizer.gradient_accumulation;
+            || accumulated_micro_batches == config.optimizer.gradient_accumulation;
         if graph_boundary {
             flush_bptt(&model, &mut accumulator, &mut pending_bptt_loss);
-            memory = memory.map(Memory::detach);
+            for memory in &mut memories {
+                *memory = memory.take().map(Memory::detach);
+            }
             chunks_in_graph = 0;
         }
         if batch.block_ended && config.memory.reset_on_work_block {
-            memory = None;
+            memories.iter_mut().for_each(|memory| *memory = None);
         }
 
-        if accumulated_chunks < config.optimizer.gradient_accumulation {
+        if accumulated_micro_batches < config.optimizer.gradient_accumulation {
             continue;
         }
 
-        let learning_rate =
-            learning_rate(config, state.tokens_seen, loader.schedule.effective_tokens);
+        let learning_rate = learning_rate(
+            config,
+            state.tokens_seen,
+            loader.schedule.phase_one_tokens,
+            loader.schedule.effective_tokens,
+        );
         model = optimizer.step(learning_rate, model, accumulator.grads());
         state.optimizer_step += 1;
         state.block_index = loader.block_index;
         state.sequence_in_block = loader.sequence_in_block;
-        let mean_loss = accumulated_loss / accumulated_chunks as f32;
-        accumulated_chunks = 0;
+        let mean_loss = accumulated_loss / accumulated_micro_batches as f32;
+        accumulated_micro_batches = 0;
         accumulated_loss = 0.0;
 
         let stop_requested =
@@ -450,7 +504,7 @@ where
 
         if state.optimizer_step.is_multiple_of(config.log_every_steps) {
             let interval_seconds = interval_start.elapsed().as_secs_f64().max(1e-6);
-            let (memory_rms, memory_abs_max) = memory_statistics(memory.as_ref())?;
+            let (memory_rms, memory_abs_max) = memory_statistics(&memories)?;
             if memory_rms.is_some_and(|value| !value.is_finite())
                 || memory_abs_max.is_some_and(|value| !value.is_finite())
             {
@@ -471,7 +525,12 @@ where
                 learning_rate,
                 tokens_per_second: interval_tokens as f64 / interval_seconds,
                 elapsed_seconds: training_start.elapsed().as_secs_f64(),
-                memory_tokens: memory.as_ref().map_or(0, |value| value.tokens_seen),
+                memory_tokens: memories
+                    .iter()
+                    .flatten()
+                    .map(|value| value.tokens_seen)
+                    .max()
+                    .unwrap_or(0),
                 document_resets: state.document_resets,
                 block_resets: state.block_resets,
                 memory_rms,
@@ -506,10 +565,17 @@ where
                 vocabulary,
                 document_token,
                 padding_token,
+                tokenizer,
                 device,
                 stateful,
             )?;
             let selected = validation.stateful.unwrap_or(validation.memoryless);
+            let previous_best = if stateful {
+                state.best_stateful_validation_loss
+            } else {
+                state.best_validation_loss
+            };
+            let improved = previous_best.is_none_or(|old| selected < old);
             let best = if stateful {
                 state.best_stateful_validation_loss = Some(
                     state
@@ -525,10 +591,43 @@ where
                 );
                 state.best_validation_loss.expect("just assigned")
             };
+            best_checkpoint_pending |= improved;
+            checkpoint_gate.request(improved);
+            append_json_line(
+                &log_path,
+                &ValidationLogEvent {
+                    event: "validation",
+                    step: state.optimizer_step,
+                    tokens_seen: state.tokens_seen,
+                    mode: if stateful {
+                        "stateful_cq"
+                    } else {
+                        "memoryless"
+                    },
+                    memoryless_loss: validation.memoryless,
+                    stateful_loss: validation.stateful,
+                    selected_loss: selected,
+                    best_selected_loss: best,
+                    improved,
+                    per_source: &validation.per_source,
+                },
+            )?;
             println!(
                 "validation step {}: memoryless {:.5}, stateful {:?}, best {:.5}",
                 state.optimizer_step, validation.memoryless, validation.stateful, best,
             );
+            for (source, metrics) in &validation.per_source {
+                println!(
+                    "  {:<12} | loss {:.5} / {:?} | ppl {:.1} / {:?} | BPB {:.3} / {:?}",
+                    source.as_str(),
+                    metrics.memoryless_loss,
+                    metrics.stateful_loss,
+                    metrics.memoryless_perplexity,
+                    metrics.stateful_perplexity,
+                    metrics.memoryless_bits_per_byte,
+                    metrics.stateful_bits_per_byte,
+                );
+            }
         }
 
         let periodic = state
@@ -542,11 +641,21 @@ where
             // model recorder, so make the reset explicit both now and after
             // resume. Model/optimizer/corpus cursor remain fully checkpointed.
             if stateful {
-                memory = None;
+                memories.iter_mut().for_each(|memory| *memory = None);
                 chunks_in_graph = 0;
                 state.checkpoint_resets += 1;
             }
             checkpoint(&config.run_dir, &model, &optimizer, &state)?;
+            if best_checkpoint_pending {
+                write_json_atomically(
+                    config.run_dir.join("checkpoints/best.json"),
+                    &LatestPointer {
+                        checkpoint_dir: format!("step-{:012}", state.optimizer_step),
+                        optimizer_step: state.optimizer_step,
+                    },
+                )?;
+                best_checkpoint_pending = false;
+            }
             println!(
                 "checkpoint saved at safe block boundary, step {} ({} tokens)",
                 state.optimizer_step, state.tokens_seen
@@ -595,7 +704,7 @@ fn stateful_chunk_loss(
     model: &Bdh<TrainingBackend>,
     criterion: &burn::nn::loss::CrossEntropyLoss<TrainingBackend>,
     batch: &TokenBatch,
-    memory: &mut Option<Memory<TrainingBackend>>,
+    memories: &mut [Option<Memory<TrainingBackend>>],
     document_token: i64,
     padding_token: i64,
     reset_on_document: bool,
@@ -603,42 +712,68 @@ fn stateful_chunk_loss(
     vocabulary: usize,
     device: &WgpuDevice,
 ) -> Result<Tensor<TrainingBackend, 1>, AnyError> {
-    debug_assert_eq!(batch.batch_size, 1);
-    let total = batch.inputs.len();
+    if memories.len() != batch.batch_size {
+        return Err(format!(
+            "stateful memory lanes changed from {} to {}",
+            memories.len(),
+            batch.batch_size
+        )
+        .into());
+    }
+    let sequence = batch.inputs.len() / batch.batch_size;
     let mut combined: Option<Tensor<TrainingBackend, 1>> = None;
-    for segment in document_segments(&batch.inputs, document_token, reset_on_document) {
-        if segment.reset_before {
-            *memory = None;
-            *document_resets += 1;
+    for (lane, memory) in memories.iter_mut().enumerate() {
+        let start = lane * sequence;
+        let end = start + sequence;
+        let lane_batch = TokenBatch {
+            inputs: batch.inputs[start..end].to_vec(),
+            targets: batch.targets[start..end].to_vec(),
+            batch_size: 1,
+            phase: batch.phase,
+            block_started: batch.block_started,
+            block_ended: batch.block_ended,
+        };
+        let mut lane_loss: Option<Tensor<TrainingBackend, 1>> = None;
+        for segment in document_segments(&lane_batch.inputs, document_token, reset_on_document) {
+            if segment.reset_before {
+                *memory = None;
+                *document_resets += 1;
+            }
+            let length = segment.range.len();
+            let physical_length = segment_bucket_length(length, sequence);
+            let (input_ids, target_ids) =
+                padded_segment_tokens(&lane_batch, segment.range, physical_length, padding_token);
+            let inputs = ids_tensor::<TrainingBackend>(input_ids, 1, physical_length, device);
+            let targets = ids_tensor::<TrainingBackend>(target_ids, 1, physical_length, device)
+                .reshape([physical_length]);
+            let output = model.forward(
+                ModelInput::TokenIds(inputs),
+                memory.take(),
+                BdhForwardOptions {
+                    valid_sequence_length: Some(length),
+                    ..Default::default()
+                },
+            )?;
+            let logits = output
+                .logits
+                .expect("default BDH forward requests logits")
+                .reshape([physical_length, vocabulary]);
+            // Burn masks padded labels to zero but averages over the physical
+            // length. This restores a mean over the original logical chunk.
+            let weighted =
+                criterion.forward(logits, targets) * (physical_length as f64 / sequence as f64);
+            lane_loss = Some(match lane_loss {
+                Some(previous) => previous + weighted,
+                None => weighted,
+            });
+            *memory = Some(output.memory);
         }
-        let length = segment.range.len();
-        let physical_length = segment_bucket_length(length, total);
-        let (input_ids, target_ids) =
-            padded_segment_tokens(batch, segment.range, physical_length, padding_token);
-        let inputs = ids_tensor::<TrainingBackend>(input_ids, 1, physical_length, device);
-        let targets = ids_tensor::<TrainingBackend>(target_ids, 1, physical_length, device)
-            .reshape([physical_length]);
-        let output = model.forward(
-            ModelInput::TokenIds(inputs),
-            memory.take(),
-            BdhForwardOptions {
-                valid_sequence_length: Some(length),
-                ..Default::default()
-            },
-        )?;
-        let logits = output
-            .logits
-            .expect("default BDH forward requests logits")
-            .reshape([physical_length, vocabulary]);
-        // Burn masks padded labels to zero but averages over the physical
-        // length. Multiplying by physical/total therefore produces exactly
-        // sum(real token losses) / original chunk length.
-        let weighted = criterion.forward(logits, targets) * (physical_length as f64 / total as f64);
+        let lane_loss =
+            lane_loss.ok_or("a stateful lane cannot be empty")? / batch.batch_size as f64;
         combined = Some(match combined {
-            Some(previous) => previous + weighted,
-            None => weighted,
+            Some(previous) => previous + lane_loss,
+            None => lane_loss,
         });
-        *memory = Some(output.memory);
     }
     combined.ok_or_else(|| "a training chunk cannot be empty".into())
 }
@@ -713,26 +848,25 @@ fn document_segments(inputs: &[i64], document_token: i64, reset: bool) -> Vec<Do
 }
 
 fn memory_statistics(
-    memory: Option<&Memory<TrainingBackend>>,
+    memories: &[Option<Memory<TrainingBackend>>],
 ) -> Result<(Option<f32>, Option<f32>), AnyError> {
-    let Some(memory) = memory else {
-        return Ok((None, None));
-    };
     let mut square_sum = 0.0_f64;
     let mut elements = 0_usize;
     let mut abs_max = 0.0_f32;
-    for weight in memory.fast_weights.iter().flatten() {
-        let count = weight.dims().into_iter().product::<usize>();
-        let mean_square = weight
-            .clone()
-            .powf_scalar(2.0)
-            .mean()
-            .to_data()
-            .to_vec::<f32>()?[0];
-        let maximum = weight.clone().abs().max().to_data().to_vec::<f32>()?[0];
-        square_sum += f64::from(mean_square) * count as f64;
-        elements += count;
-        abs_max = abs_max.max(maximum);
+    for memory in memories.iter().flatten() {
+        for weight in memory.fast_weights.iter().flatten() {
+            let count = weight.dims().into_iter().product::<usize>();
+            let mean_square = weight
+                .clone()
+                .powf_scalar(2.0)
+                .mean()
+                .to_data()
+                .to_vec::<f32>()?[0];
+            let maximum = weight.clone().abs().max().to_data().to_vec::<f32>()?[0];
+            square_sum += f64::from(mean_square) * count as f64;
+            elements += count;
+            abs_max = abs_max.max(maximum);
+        }
     }
     if elements == 0 {
         Ok((None, None))
@@ -808,24 +942,41 @@ impl TokenLoader {
         let Some(block) = self.schedule.blocks.get(current_block).cloned() else {
             return Ok(None);
         };
-        let batch_size = requested.min(block.sequences - sequence_before);
-        let start = block.token_start + (sequence_before * self.sequence_length) as u64;
-        let tokens = self
-            .corpora
-            .get_mut(&block.source)
-            .expect("all schedule sources were opened")
-            .read_tokens(start, batch_size * self.sequence_length + 1)?;
+        if !block.sequences.is_multiple_of(requested) || !sequence_before.is_multiple_of(requested)
+        {
+            return Err(format!(
+                "work block of {} sequences cannot form {requested} stable lanes at cursor {sequence_before}",
+                block.sequences
+            ));
+        }
+        let batch_size = requested;
+        let lane_length = block.sequences / batch_size;
+        let lane_step = sequence_before / batch_size;
+        if lane_step >= lane_length {
+            return Err("normalized loader cursor exceeded its work block".into());
+        }
         let mut inputs = Vec::with_capacity(batch_size * self.sequence_length);
         let mut targets = Vec::with_capacity(batch_size * self.sequence_length);
-        for sequence in 0..batch_size {
-            let offset = sequence * self.sequence_length;
+        // Each row advances through one contiguous stripe of the work block.
+        // Consequently row `lane` at the next call receives the immediately
+        // following chunk instead of skipping over the other batch rows.
+        for lane in 0..batch_size {
+            let sequence =
+                striped_sequence_index(block.sequences, batch_size, sequence_before, lane);
+            debug_assert_eq!(sequence, lane * lane_length + lane_step);
+            let start = block.token_start + (sequence * self.sequence_length) as u64;
+            let tokens = self
+                .corpora
+                .get_mut(&block.source)
+                .expect("all schedule sources were opened")
+                .read_tokens(start, self.sequence_length + 1)?;
             inputs.extend(
-                tokens[offset..offset + self.sequence_length]
+                tokens[..self.sequence_length]
                     .iter()
                     .map(|id| i64::from(*id)),
             );
             targets.extend(
-                tokens[offset + 1..offset + self.sequence_length + 1]
+                tokens[1..self.sequence_length + 1]
                     .iter()
                     .map(|id| i64::from(*id)),
             );
@@ -883,6 +1034,19 @@ impl TokenLoader {
     }
 }
 
+/// Map a stable document lane to its next contiguous sequence in a block.
+fn striped_sequence_index(
+    block_sequences: usize,
+    batch_size: usize,
+    sequence_cursor: usize,
+    lane: usize,
+) -> usize {
+    debug_assert!(block_sequences.is_multiple_of(batch_size));
+    debug_assert!(sequence_cursor.is_multiple_of(batch_size));
+    debug_assert!(lane < batch_size);
+    lane * (block_sequences / batch_size) + sequence_cursor / batch_size
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate(
     model: &Bdh<TrainingBackend>,
@@ -891,6 +1055,7 @@ fn validate(
     vocabulary: usize,
     document_token: i64,
     padding_token: i64,
+    tokenizer: &Tokenizer,
     device: &WgpuDevice,
     stateful: bool,
 ) -> Result<ValidationMetrics, AnyError> {
@@ -899,21 +1064,45 @@ fn validate(
     let padded_criterion = CrossEntropyLossConfig::new()
         .with_pad_tokens(Some(vec![padding_token as usize]))
         .init(device);
-    let mut memoryless_total = 0.0_f32;
-    let mut stateful_total = 0.0_f32;
+    let mut accumulators = BTreeMap::<CorpusSource, ValidationAccumulator>::new();
+    for source in CorpusSource::all() {
+        accumulators.insert(source, ValidationAccumulator::default());
+    }
     let mut memories: BTreeMap<CorpusSource, Option<Memory<InferenceBackend>>> = BTreeMap::new();
     for source in CorpusSource::all() {
         memories.insert(source, None);
     }
     for index in 0..config.validation_batches {
         let source = CorpusSource::all()[index % 3];
-        let sequence_index = (index / 3 * config.optimizer.micro_batch_size) as u64;
-        let batch =
-            loader.validation_batch(source, sequence_index, config.optimizer.micro_batch_size)?;
-        memoryless_total += inference_chunk_loss(
+        // Stateful validation keeps one exactly contiguous stream per source.
+        // Training may use several striped document lanes, but batching those
+        // here would require one rotary cursor per row and would change the
+        // metric when `micro_batch_size` changes.
+        let sequence_index = (index / 3) as u64;
+        let batch = loader.validation_batch(source, sequence_index, 1)?;
+        let memoryless = inference_chunk_loss(
             &inference, &criterion, &batch, None, None, vocabulary, device,
         )?
         .0;
+        let target_tokens = batch.targets.len() as u64;
+        let target_ids = batch
+            .targets
+            .iter()
+            .map(|id| u32::try_from(*id))
+            .collect::<Result<Vec<_>, _>>()?;
+        // `skip_special_tokens=true` removes <|doc|>/<|pad|>, which do not
+        // correspond to bytes in the source document. ByteLevel decoding of
+        // the complete chunk preserves the original UTF-8 byte accounting.
+        let decoded_utf8_bytes = tokenizer
+            .decode(&target_ids, true)
+            .map_err(|error| format!("cannot decode validation targets: {error}"))?
+            .len() as u64;
+        let accumulator = accumulators
+            .get_mut(&source)
+            .expect("all validation sources have accumulators");
+        accumulator.memoryless_loss_sum += f64::from(memoryless) * target_tokens as f64;
+        accumulator.target_tokens += target_tokens;
+        accumulator.decoded_utf8_bytes += decoded_utf8_bytes;
         if stateful {
             let mut memory = memories.remove(&source).flatten();
             let mut weighted = 0.0_f32;
@@ -945,15 +1134,56 @@ fn validate(
                 weighted += value * physical_length as f32 / batch.inputs.len() as f32;
                 memory = next;
             }
-            stateful_total += weighted;
+            accumulator.stateful_loss_sum += f64::from(weighted) * target_tokens as f64;
             memories.insert(source, memory);
         }
     }
-    let divisor = config.validation_batches as f32;
+    let mut per_source = BTreeMap::new();
+    let mut total = ValidationAccumulator::default();
+    for source in CorpusSource::all() {
+        let accumulator = accumulators[&source];
+        if accumulator.target_tokens == 0 || accumulator.decoded_utf8_bytes == 0 {
+            return Err(format!("validation source {} produced no text", source.as_str()).into());
+        }
+        let memoryless_loss =
+            (accumulator.memoryless_loss_sum / accumulator.target_tokens as f64) as f32;
+        let stateful_loss = stateful
+            .then_some((accumulator.stateful_loss_sum / accumulator.target_tokens as f64) as f32);
+        per_source.insert(
+            source,
+            validation_source_metrics(memoryless_loss, stateful_loss, accumulator),
+        );
+        total.memoryless_loss_sum += accumulator.memoryless_loss_sum;
+        total.stateful_loss_sum += accumulator.stateful_loss_sum;
+        total.target_tokens += accumulator.target_tokens;
+        total.decoded_utf8_bytes += accumulator.decoded_utf8_bytes;
+    }
     Ok(ValidationMetrics {
-        memoryless: memoryless_total / divisor,
-        stateful: stateful.then_some(stateful_total / divisor),
+        memoryless: (total.memoryless_loss_sum / total.target_tokens as f64) as f32,
+        stateful: stateful.then_some((total.stateful_loss_sum / total.target_tokens as f64) as f32),
+        per_source,
     })
+}
+
+fn validation_source_metrics(
+    memoryless_loss: f32,
+    stateful_loss: Option<f32>,
+    accumulator: ValidationAccumulator,
+) -> SourceValidationMetrics {
+    let bits_per_byte = |loss: f32| {
+        (f64::from(loss) * accumulator.target_tokens as f64
+            / (std::f64::consts::LN_2 * accumulator.decoded_utf8_bytes as f64)) as f32
+    };
+    SourceValidationMetrics {
+        memoryless_loss,
+        memoryless_perplexity: memoryless_loss.exp(),
+        memoryless_bits_per_byte: bits_per_byte(memoryless_loss),
+        stateful_loss,
+        stateful_perplexity: stateful_loss.map(f32::exp),
+        stateful_bits_per_byte: stateful_loss.map(bits_per_byte),
+        target_tokens: accumulator.target_tokens,
+        decoded_utf8_bytes: accumulator.decoded_utf8_bytes,
+    }
 }
 
 fn inference_chunk_loss(
@@ -999,12 +1229,47 @@ fn ids_tensor<B: Backend>(
     Tensor::from_data(TensorData::new(ids, [batch, sequence]), device)
 }
 
-fn learning_rate(config: &PretrainConfig, tokens_seen: u64, total_tokens: u64) -> f64 {
+fn learning_rate(
+    config: &PretrainConfig,
+    tokens_seen: u64,
+    phase_one_tokens: u64,
+    total_tokens: u64,
+) -> f64 {
+    if config.optimizer.focus_max_learning_rate > 0.0 && tokens_seen >= phase_one_tokens {
+        let focus_tokens = tokens_seen.saturating_sub(phase_one_tokens);
+        let focus_min = if config.optimizer.focus_min_learning_rate > 0.0 {
+            config.optimizer.focus_min_learning_rate
+        } else {
+            config.optimizer.min_learning_rate
+        };
+        let focus_max = config.optimizer.focus_max_learning_rate;
+        if focus_tokens < config.optimizer.focus_warmup_tokens {
+            let progress = focus_tokens as f64 / config.optimizer.focus_warmup_tokens.max(1) as f64;
+            return config.optimizer.min_learning_rate
+                + (focus_max - config.optimizer.min_learning_rate) * progress;
+        }
+        let decay_tokens = total_tokens
+            .saturating_sub(phase_one_tokens)
+            .saturating_sub(config.optimizer.focus_warmup_tokens)
+            .max(1);
+        let progress = focus_tokens
+            .saturating_sub(config.optimizer.focus_warmup_tokens)
+            .min(decay_tokens) as f64
+            / decay_tokens as f64;
+        let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+        return focus_min + (focus_max - focus_min) * cosine;
+    }
+
     if tokens_seen < config.optimizer.warmup_tokens {
         return config.optimizer.max_learning_rate * tokens_seen as f64
             / config.optimizer.warmup_tokens.max(1) as f64;
     }
-    let decay_tokens = total_tokens
+    let decay_end = if config.optimizer.focus_max_learning_rate > 0.0 {
+        phase_one_tokens
+    } else {
+        total_tokens
+    };
+    let decay_tokens = decay_end
         .saturating_sub(config.optimizer.warmup_tokens)
         .max(1);
     let progress = tokens_seen
@@ -1041,7 +1306,7 @@ fn import_state(
     packed_corpora_sha256: &str,
 ) -> Result<RunState, AnyError> {
     let mut state: RunState = serde_json::from_slice(&fs::read(checkpoint.join("state.json"))?)?;
-    if state.format_version != 1 && state.format_version != 2 {
+    if state.format_version != 1 && state.format_version != 2 && state.format_version != 3 {
         return Err(format!(
             "cannot import checkpoint state version {}",
             state.format_version
@@ -1065,7 +1330,7 @@ fn import_state(
     if !config.continuation_compatible_with(&previous) {
         return Err("new config changes more than run_dir/memory policy; refusing import".into());
     }
-    state.format_version = 2;
+    state.format_version = if config.format_version >= 2 { 3 } else { 2 };
     state.config_sha256 = config_sha256.to_owned();
     state.cq_activation_tokens = config
         .memory
@@ -1134,9 +1399,9 @@ fn validate_resume_state(
     tokenizer_sha256: &str,
     packed_corpora_sha256: &str,
 ) -> Result<(), String> {
-    if state.format_version != 2 {
+    if state.format_version != 2 && state.format_version != 3 {
         return Err(format!(
-            "CQ run requires checkpoint state version 2, got {}",
+            "CQ run requires checkpoint state version 2 or 3, got {}",
             state.format_version
         ));
     }
@@ -1178,6 +1443,10 @@ fn freeze_config(run_dir: &Path, source: &Path, expected_sha256: &str) -> Result
 }
 
 fn prune_checkpoints(checkpoints: &Path, keep: usize) -> Result<(), std::io::Error> {
+    let protected_best = fs::read(checkpoints.join("best.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LatestPointer>(&bytes).ok())
+        .map(|pointer| pointer.checkpoint_dir);
     let mut directories = fs::read_dir(checkpoints)?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
@@ -1185,8 +1454,19 @@ fn prune_checkpoints(checkpoints: &Path, keep: usize) -> Result<(), std::io::Err
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
     directories.sort();
-    let remove_count = directories.len().saturating_sub(keep);
-    for directory in directories.into_iter().take(remove_count) {
+    let newest = directories
+        .iter()
+        .rev()
+        .take(keep)
+        .cloned()
+        .collect::<Vec<_>>();
+    for directory in directories {
+        let name = directory
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned());
+        if newest.contains(&directory) || name == protected_best {
+            continue;
+        }
         fs::remove_dir_all(directory)?;
     }
     Ok(())
@@ -1348,5 +1628,77 @@ mod tests {
         let mut gate = CheckpointGate::default();
         gate.request(true);
         assert!(gate.finish_optimizer_step(false));
+    }
+
+    #[test]
+    fn striped_lanes_advance_contiguously_without_cross_talk() {
+        assert_eq!(
+            (0..4)
+                .map(|lane| striped_sequence_index(256, 4, 0, lane))
+                .collect::<Vec<_>>(),
+            vec![0, 64, 128, 192]
+        );
+        assert_eq!(
+            (0..4)
+                .map(|lane| striped_sequence_index(256, 4, 4, lane))
+                .collect::<Vec<_>>(),
+            vec![1, 65, 129, 193]
+        );
+        for lane in 0..4 {
+            let positions = (0..64)
+                .map(|step| striped_sequence_index(256, 4, step * 4, lane))
+                .collect::<Vec<_>>();
+            assert!(positions.windows(2).all(|pair| pair[1] == pair[0] + 1));
+        }
+    }
+
+    #[test]
+    fn v2_learning_rate_rewarms_at_the_focus_boundary() {
+        let config = PretrainConfig::from_path("configs/rx6700-v2.json").unwrap();
+        let schedule = TrainingSchedule::build(&config).unwrap();
+        let phase_one = schedule.phase_one_tokens;
+        let total = schedule.effective_tokens;
+        let close = |actual: f64, expected: f64| {
+            assert!((actual - expected).abs() < 1e-10, "{actual} != {expected}")
+        };
+
+        close(learning_rate(&config, 0, phase_one, total), 0.0);
+        close(
+            learning_rate(&config, config.optimizer.warmup_tokens, phase_one, total),
+            config.optimizer.max_learning_rate,
+        );
+        close(
+            learning_rate(&config, phase_one, phase_one, total),
+            config.optimizer.min_learning_rate,
+        );
+        close(
+            learning_rate(
+                &config,
+                phase_one + config.optimizer.focus_warmup_tokens,
+                phase_one,
+                total,
+            ),
+            config.optimizer.focus_max_learning_rate,
+        );
+        close(
+            learning_rate(&config, total, phase_one, total),
+            config.optimizer.focus_min_learning_rate,
+        );
+    }
+
+    #[test]
+    fn bits_per_byte_uses_cross_entropy_nats_and_decoded_bytes() {
+        let metrics = validation_source_metrics(
+            std::f32::consts::LN_2,
+            Some(2.0 * std::f32::consts::LN_2),
+            ValidationAccumulator {
+                memoryless_loss_sum: 0.0,
+                stateful_loss_sum: 0.0,
+                target_tokens: 100,
+                decoded_utf8_bytes: 200,
+            },
+        );
+        assert!((metrics.memoryless_bits_per_byte - 0.5).abs() < 1e-6);
+        assert!((metrics.stateful_bits_per_byte.unwrap() - 1.0).abs() < 1e-6);
     }
 }

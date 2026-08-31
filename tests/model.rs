@@ -4,6 +4,7 @@ use bdh_cq_llm::{
 };
 use burn::{
     backend::{Autodiff, NdArray},
+    module::Module,
     tensor::{Int, Tensor, TensorData, Tolerance, backend::Backend},
 };
 
@@ -297,4 +298,92 @@ fn depth_bias_matches_upstream_indexing_examples() {
         no_reasoning.to_data().to_vec::<f32>().unwrap(),
         vec![0.0; 5]
     );
+}
+
+#[test]
+fn architecture_v2_features_compose_and_backpropagate() {
+    let device = Default::default();
+    let model = BdhConfig::new(24, 32)
+        .with_depth(3)
+        .with_heads(4)
+        .with_dim_qk_heads(256)
+        .with_rotary_dim(16)
+        .with_tie_embeddings(true)
+        .with_attn_residual(true)
+        .with_attn_residual_tied(true)
+        .with_gated_neuron_state(true)
+        .with_cq_memory_decay(true)
+        .with_cq_memory_retention(0.99)
+        .init::<TrainBackend>(&device)
+        .unwrap();
+
+    assert_eq!(model.rotary_features_per_head(), 16);
+    assert!(model.has_tied_embeddings());
+    assert!(model.has_cq_memory_decay());
+    let output = model
+        .forward(
+            ModelInput::TokenIds(ids(2, 6, &device)),
+            None,
+            BdhForwardOptions {
+                collect_per_pass_hiddens: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(output.logits.as_ref().unwrap().dims(), [2, 6, 24]);
+    assert_eq!(output.per_pass_hiddens.len(), 3);
+    assert!(
+        output
+            .memory
+            .fast_weights
+            .iter()
+            .all(|state| state.as_ref().unwrap().dims() == [2, 4, 64, 32])
+    );
+    let loss = output.logits.unwrap().powf_scalar(2.0).mean();
+    assert!(loss.to_data().to_vec::<f32>().unwrap()[0].is_finite());
+    let _gradients = loss.backward();
+}
+
+#[test]
+fn tying_embeddings_removes_the_separate_vocabulary_matrix() {
+    let device = Default::default();
+    let untied = tiny_config().init::<TestBackend>(&device).unwrap();
+    let tied = tiny_config()
+        .with_tie_embeddings(true)
+        .init::<TestBackend>(&device)
+        .unwrap();
+    assert_eq!(untied.num_params() - tied.num_params(), 16 * 32);
+    assert_eq!(
+        tied.project_logits(Tensor::zeros([2, 5, 32], &device))
+            .dims(),
+        [2, 5, 16]
+    );
+}
+
+#[test]
+fn tied_logits_have_variance_preserving_initial_scale() {
+    let device = Default::default();
+    TestBackend::seed(&device, 999);
+    let model = BdhConfig::new(4_096, 64)
+        .with_depth(1)
+        .with_heads(4)
+        .with_dim_qk_heads(256)
+        .with_tie_embeddings(true)
+        .init::<TestBackend>(&device)
+        .unwrap();
+    let maximum = model
+        .forward(
+            ModelInput::TokenIds(ids(1, 8, &device)),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+        .logits
+        .unwrap()
+        .abs()
+        .max()
+        .to_data()
+        .to_vec::<f32>()
+        .unwrap()[0];
+    assert!(maximum < 10.0, "initial tied logit magnitude {maximum}");
 }

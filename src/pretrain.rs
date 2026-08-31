@@ -1,8 +1,9 @@
 //! Reproducible data and run configuration for full language-model pretraining.
 //!
 //! Raw dataset adapters emit UTF-8 documents.  The packing step tokenizes them
-//! once and stores token ids as little-endian `u16`: the fixed 32,768-token
-//! vocabulary fits exactly, and training never has to repeat expensive BPE.
+//! once and stores token ids as little-endian `u16`: both the legacy 32,768
+//! vocabulary and v2's 24,576 entries fit exactly, and training never has to
+//! repeat expensive BPE.
 //! A small binary header and a JSON manifest make accidental tokenizer/data
 //! mismatches fail before the first GPU allocation.
 
@@ -90,6 +91,38 @@ pub struct ModelConfig {
     pub heads: usize,
     /// Total positive Q/K feature width across all heads.
     pub dim_qk_heads: usize,
+    /// Leading positional features per head; zero keeps legacy `Q / 2`.
+    #[serde(default)]
+    pub rotary_dim: usize,
+    /// Share the token embedding with the language-model projection.
+    #[serde(default)]
+    pub tie_embeddings: bool,
+    /// Replace additive residuals with attention over seed plus block deltas.
+    #[serde(default)]
+    pub attn_residual: bool,
+    /// Reuse one residual pseudo-query at every recurrent depth.
+    #[serde(default = "default_true")]
+    pub attn_residual_tied: bool,
+    /// Optional distance-to-final-latent bias; zero on language pretraining.
+    #[serde(default)]
+    pub attn_residual_depth_bias_distance: usize,
+    /// Carry the full positive neuron workspace across depth within a chunk.
+    #[serde(default)]
+    pub gated_neuron_state: bool,
+    /// Apply learned exponential retention to CQ fast weights.
+    #[serde(default)]
+    pub cq_memory_decay: bool,
+    /// Initial CQ retention probability.
+    #[serde(default = "default_cq_retention")]
+    pub cq_memory_retention: f64,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_cq_retention() -> f64 {
+    0.995
 }
 
 /// AdamW and batch-scheduling settings.
@@ -105,6 +138,15 @@ pub struct OptimizerConfig {
     pub min_learning_rate: f64,
     /// Number of processed tokens used for linear warmup.
     pub warmup_tokens: u64,
+    /// Optional peak LR after entering Ficbook focus; zero keeps one cosine.
+    #[serde(default)]
+    pub focus_max_learning_rate: f64,
+    /// Final LR for the focus cosine; zero falls back to `min_learning_rate`.
+    #[serde(default)]
+    pub focus_min_learning_rate: f64,
+    /// Focus-stage linear re-warmup length.
+    #[serde(default)]
+    pub focus_warmup_tokens: u64,
     /// Adam first-moment decay.
     pub beta_1: f32,
     /// Adam second-moment decay.
@@ -113,6 +155,16 @@ pub struct OptimizerConfig {
     pub weight_decay: f32,
     /// Global gradient norm limit.
     pub gradient_clip_norm: f32,
+}
+
+/// Extra source replay mixed into the Ficbook-focused stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct FocusReplayConfig {
+    /// Re-read this many leading FineWeb training tokens.
+    pub fineweb2_hq_tokens: u64,
+    /// Re-read this many leading classic-literature training tokens.
+    pub ru_classic_tokens: u64,
 }
 
 /// Complete, serializable contract shared by the packer and trainer.
@@ -155,7 +207,7 @@ impl MemoryTrainingConfig {
 /// Complete, serializable contract shared by the packer and trainer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PretrainConfig {
-    /// Configuration schema version; currently `1`.
+    /// Configuration schema version (`1` legacy, `2` architecture-v2).
     pub format_version: u32,
     /// Path to the trained Hugging Face tokenizer JSON.
     pub tokenizer: PathBuf,
@@ -173,6 +225,9 @@ pub struct PretrainConfig {
     pub sources: BTreeMap<String, SourceBudget>,
     /// Ficbook tokens mixed into phase one; the remainder forms phase two.
     pub ficbook_phase_one_tokens: u64,
+    /// General-domain replay mixed into phase two.
+    #[serde(default)]
+    pub focus_replay: FocusReplayConfig,
     /// Architecture dimensions.
     pub model: ModelConfig,
     /// Optimizer and batching settings.
@@ -211,9 +266,9 @@ impl PretrainConfig {
 
     /// Reject inconsistent dimensions, budgets and schedules before work starts.
     pub fn validate(&self) -> Result<(), String> {
-        if self.format_version != 1 {
+        if self.format_version != 1 && self.format_version != 2 {
             return Err(format!(
-                "unsupported config format {}, expected 1",
+                "unsupported config format {}, expected 1 or 2",
                 self.format_version
             ));
         }
@@ -237,9 +292,6 @@ impl PretrainConfig {
         if self.memory.chunks_per_detach == 0 {
             return Err("memory.chunks_per_detach must be non-zero".into());
         }
-        if self.memory.stateful_after_tokens != u64::MAX && self.optimizer.micro_batch_size != 1 {
-            return Err("stateful CQ training currently requires micro_batch_size = 1".into());
-        }
         if self.memory.stateful_after_tokens != u64::MAX
             && !self
                 .optimizer
@@ -252,6 +304,18 @@ impl PretrainConfig {
         }
         if self.model.heads == 0 || !self.model.dim_qk_heads.is_multiple_of(self.model.heads) {
             return Err("dim_qk_heads must be divisible by a non-zero head count".into());
+        }
+        let qk_per_head = self.model.dim_qk_heads / self.model.heads;
+        let rotary_dim = if self.model.rotary_dim == 0 {
+            qk_per_head / 2
+        } else {
+            self.model.rotary_dim
+        };
+        if rotary_dim > qk_per_head || !rotary_dim.is_multiple_of(2) {
+            return Err("model.rotary_dim must be even and no greater than Q".into());
+        }
+        if !(0.0 < self.model.cq_memory_retention && self.model.cq_memory_retention < 1.0) {
+            return Err("model.cq_memory_retention must be in (0, 1)".into());
         }
         for source in CorpusSource::all() {
             let budget = self.budget(source)?;
@@ -270,10 +334,27 @@ impl PretrainConfig {
         {
             return Err("ficbook_phase_one_tokens must split the Ficbook training range".into());
         }
+        if self.focus_replay.fineweb2_hq_tokens
+            > self.budget(CorpusSource::Fineweb2Hq)?.train_tokens
+            || self.focus_replay.ru_classic_tokens
+                > self.budget(CorpusSource::RuClassic)?.train_tokens
+        {
+            return Err("focus replay cannot exceed its source training range".into());
+        }
         if !(0.0 < self.optimizer.min_learning_rate
             && self.optimizer.min_learning_rate <= self.optimizer.max_learning_rate)
         {
             return Err("learning rates must satisfy 0 < min <= max".into());
+        }
+        if self.optimizer.focus_max_learning_rate > 0.0 {
+            let focus_min = if self.optimizer.focus_min_learning_rate > 0.0 {
+                self.optimizer.focus_min_learning_rate
+            } else {
+                self.optimizer.min_learning_rate
+            };
+            if focus_min > self.optimizer.focus_max_learning_rate {
+                return Err("focus learning rates must satisfy 0 < min <= max".into());
+            }
         }
         Ok(())
     }
@@ -289,9 +370,9 @@ impl PretrainConfig {
 
     /// Check that a checkpoint may continue under a new run contract.
     ///
-    /// Continuation may change only the output directory and the newly added
-    /// memory policy. Model, optimizer, corpus and deterministic schedule stay
-    /// byte-for-byte compatible at the saved cursor.
+    /// Continuation may change the output directory, memory curriculum and
+    /// logging/checkpoint cadence. Model, optimizer, corpus and deterministic
+    /// schedule stay byte-for-byte compatible at the saved cursor.
     pub fn continuation_compatible_with(&self, previous: &Self) -> bool {
         self.format_version == previous.format_version
             && self.tokenizer == previous.tokenizer
@@ -301,12 +382,9 @@ impl PretrainConfig {
             && self.block_sequences == previous.block_sequences
             && self.sources == previous.sources
             && self.ficbook_phase_one_tokens == previous.ficbook_phase_one_tokens
+            && self.focus_replay == previous.focus_replay
             && self.model == previous.model
             && self.optimizer == previous.optimizer
-            && self.checkpoint_every_steps == previous.checkpoint_every_steps
-            && self.validation_every_steps == previous.validation_every_steps
-            && self.validation_batches == previous.validation_batches
-            && self.log_every_steps == previous.log_every_steps
     }
 }
 
@@ -477,6 +555,8 @@ pub struct TrainingSchedule {
     pub effective_tokens: u64,
     /// Index of the first phase-two block.
     pub phase_two_block: usize,
+    /// Effective number of tokens before phase two begins.
+    pub phase_one_tokens: u64,
 }
 
 impl TrainingSchedule {
@@ -516,6 +596,22 @@ impl TrainingSchedule {
             config.ficbook_phase_one_tokens,
             config.budget(CorpusSource::Ficbook)?.train_tokens,
         );
+        add_range_blocks(
+            &mut phase_two,
+            config,
+            CurriculumPhase::FicbookFocus,
+            CorpusSource::Fineweb2Hq,
+            0,
+            config.focus_replay.fineweb2_hq_tokens,
+        );
+        add_range_blocks(
+            &mut phase_two,
+            config,
+            CurriculumPhase::FicbookFocus,
+            CorpusSource::RuClassic,
+            0,
+            config.focus_replay.ru_classic_tokens,
+        );
 
         // Every block contains whole micro-batches.  Trim at most
         // `gradient_accumulation - 1` final micro-batches so the schedule ends
@@ -533,6 +629,10 @@ impl TrainingSchedule {
         phase_one.shuffle(&mut StdRng::seed_from_u64(config.seed));
         phase_two.shuffle(&mut StdRng::seed_from_u64(config.seed ^ 0xf1cb_00c5));
         let phase_two_block = phase_one.len();
+        let phase_one_tokens = phase_one
+            .iter()
+            .map(|block| block.sequences as u64 * config.sequence_length as u64)
+            .sum();
         phase_one.extend(phase_two);
         let effective_tokens = phase_one
             .iter()
@@ -542,6 +642,7 @@ impl TrainingSchedule {
             blocks: phase_one,
             effective_tokens,
             phase_two_block,
+            phase_one_tokens,
         })
     }
 }
@@ -659,5 +760,52 @@ mod tests {
             .sum::<usize>();
         let micro_batches = effective_sequences / config.optimizer.micro_batch_size;
         assert!(micro_batches.is_multiple_of(config.optimizer.gradient_accumulation));
+    }
+
+    #[test]
+    fn v2_config_builds_the_750m_plus_300m_replay_schedule() {
+        let config = PretrainConfig::from_path("configs/rx6700-v2.json").unwrap();
+        assert_eq!(config.format_version, 2);
+        assert_eq!(config.total_train_tokens().unwrap(), 1_000_000_000);
+        assert_eq!(config.model.rotary_dim, 64);
+        assert!(config.model.tie_embeddings);
+        assert!(config.model.attn_residual);
+        assert!(config.model.gated_neuron_state);
+        assert!(config.model.cq_memory_decay);
+
+        let schedule = TrainingSchedule::build(&config).unwrap();
+        let tolerance = (config.sequence_length
+            * config.optimizer.micro_batch_size
+            * config.optimizer.gradient_accumulation) as u64;
+        assert!(schedule.phase_one_tokens.abs_diff(750_000_000) < tolerance);
+        assert!(schedule.effective_tokens.abs_diff(1_050_000_000) < tolerance);
+        assert!(
+            (schedule.effective_tokens - schedule.phase_one_tokens).abs_diff(300_000_000)
+                < tolerance
+        );
+    }
+
+    #[test]
+    fn all_v2_pilot_configs_are_fixed_budget_cq_ablations() {
+        let cases = [
+            ("additive", false, false),
+            ("attnres", true, false),
+            ("state", false, true),
+            ("attnres-state", true, true),
+        ];
+        for (name, attention_residual, neuron_state) in cases {
+            let path = format!("configs/rx6700-v2-pilot-{name}.json");
+            let config = PretrainConfig::from_path(path).unwrap();
+            assert_eq!(config.memory.stateful_after_tokens, 5_000_000);
+            assert_eq!(config.model.attn_residual, attention_residual);
+            assert_eq!(config.model.gated_neuron_state, neuron_state);
+            assert_eq!(config.model.dim_qk_heads, 6_144);
+            assert_eq!(
+                config.optimizer.micro_batch_size as u64
+                    * config.optimizer.gradient_accumulation as u64
+                    * config.sequence_length as u64,
+                16_384
+            );
+        }
     }
 }

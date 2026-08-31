@@ -32,6 +32,9 @@ boundary precisely.
    65/30/5 streaming sample, reserved IDs, and reproducible training command.
 8. [`docs/pretraining.md`](docs/pretraining.md) — the exact 1B-token curriculum,
    packed-data format, RX 6700 XT profile, checkpoints, resume, and operations.
+9. [`docs/v2-training.md`](docs/v2-training.md) — the redesigned body-heavy
+   model, full depth-local neuron state, decaying CQ, 1.05B replay schedule,
+   width benchmark, 2×2 pilots, and production gate.
 
 Every public item is documented, and the dense tensor operations have inline
 shape annotations next to the implementation.
@@ -105,6 +108,21 @@ resumes its latest checkpoint, and follows the 750M general + 250M Ficbook-focus
 curriculum. Read [`docs/pretraining.md`](docs/pretraining.md) before starting a
 multi-day run.
 
+The new architecture-v2 run is intentionally separate. Prepare its body-only
+24,576-token ABI, benchmark the three body widths and run the four 20M-token
+pilots before starting production:
+
+```console
+scripts/prepare_v2_data.sh /tmp/bdh-cq-tokenizer-venv/bin/python
+python3 scripts/benchmark_v2_widths.py 0
+scripts/run_v2_pilots.sh 0
+cargo run --release --bin train_llm -- --config configs/rx6700-v2.json
+```
+
+These commands do not add chat-role labels or content filters. See
+[`docs/v2-training.md`](docs/v2-training.md) for the exact acceptance criteria
+and why the production command must be run only after choosing the pilot winner.
+
 The training examples are mechanics demonstrations, not reproductions of paper
 results. `train_tiny_icq` covers the latent-reasoning objective behind the
 figure-7 script; `train_tiny_bytes` covers the ordinary next-byte objective in
@@ -121,6 +139,10 @@ counts and replace the CPU backend for real experiments.
 - token ingestion, embedding ingestion, latent “think” stages, latent
   supervision, and answer next-token supervision;
 - optional Attention Residual history and its cycle-distance bias;
+- optional full positive neuron state carried across recurrent depth, with a
+  bounded input-dependent update gate;
+- optional learned per-head CQ decay, explicit RoPE width and tied token/LM
+  embeddings;
 - greedy or top-k/temperature generation;
 - propagation, copying, ordering, and nesting task families;
 - the 14-token grid codec and the complete public ARC objective;

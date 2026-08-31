@@ -148,8 +148,9 @@ The current chunk proposes:
 
 ```text
 ΔM_l = K_rot^T V                           [B,H,Q,D]
-M_l' = M_l + ΔM_l                          when update_memory = true
-M_l' = M_l                                 otherwise
+M_l' = M_l + ΔM_l                          legacy additive update
+M_l' = sigmoid(ρ_h) M_l + ΔM_l             optional v2 learned decay
+M_l' = M_l                                 when update_memory = false
 ```
 
 The block always computes its local write because it is also useful for a
@@ -180,6 +181,16 @@ parameter-free LayerNorm. The optional Attention Residual replaces the
 identity branch `X_l` with a learned mixture of saved earlier depth/reasoning
 states. It is an experimental extension in the public repository, not a
 disclosed BDH-CQ component.
+
+### 4.6 Architecture-v2 depth-local neuron state
+
+The production-v2 experiment optionally retains the complete positive
+`[B,H,N,Q]` lift between applications of the shared block. A token/head scalar
+gate forms a bounded EMA and the next depth can inject an RMS-normalized copy
+into its Q/K gate. This is reset at every outer `forward`; it is not serialized
+inside [`Memory`](../src/model.rs), does not cross token chunks, and does not
+replace CQ. See [`v2-training.md`](v2-training.md) for its equations,
+initialization and 2×2 ablation.
 
 ## 5. Contextual memory versus latent workspace
 

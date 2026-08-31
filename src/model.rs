@@ -147,6 +147,16 @@ pub struct BdhConfig {
     /// Total Q/K feature count across all heads (`H * Q`).
     #[config(default = 32_768)]
     pub dim_qk_heads: usize,
+    /// Number of leading Q/K features per head carrying rotary position.
+    ///
+    /// Zero preserves the original port's `Q / 2` rule. Wide v2 models set
+    /// this explicitly to 64 so most positive neuron features remain purely
+    /// semantic rather than being rotated into signed coordinates.
+    #[config(default = 0)]
+    pub rotary_dim: usize,
+    /// Reuse the input embedding matrix for vocabulary projection.
+    #[config(default = false)]
+    pub tie_embeddings: bool,
     /// Replace identity residual addition with attention across depth/history.
     #[config(default = false)]
     pub attn_residual: bool,
@@ -156,6 +166,15 @@ pub struct BdhConfig {
     /// Number of learnable cycle-distance bias values; zero disables the bias.
     #[config(default = 0)]
     pub attn_residual_depth_bias_distance: usize,
+    /// Carry the full `[B,H,N,Q]` positive workspace across recurrent depth.
+    #[config(default = false)]
+    pub gated_neuron_state: bool,
+    /// Exponentially retain old CQ fast weights before adding the new write.
+    #[config(default = false)]
+    pub cq_memory_decay: bool,
+    /// Initial per-head CQ retention when decay is enabled.
+    #[config(default = 0.995)]
+    pub cq_memory_retention: f64,
 }
 
 impl BdhConfig {
@@ -164,7 +183,19 @@ impl BdhConfig {
         self.validate()?;
 
         let qk_per_head = self.dim_qk_heads / self.heads;
-        let block = BdhBlock::new(self.dim, self.heads, qk_per_head, device);
+        let rotary_dim = if self.rotary_dim == 0 {
+            qk_per_head / 2
+        } else {
+            self.rotary_dim
+        };
+        let block = BdhBlock::new(
+            self.dim,
+            self.heads,
+            qk_per_head,
+            rotary_dim,
+            self.gated_neuron_state,
+            device,
+        );
         let attention_residual = self.attn_residual.then(|| {
             let pseudo_queries = if self.attn_residual_tied {
                 1
@@ -182,17 +213,25 @@ impl BdhConfig {
         Ok(Bdh {
             token_embed: EmbeddingConfig::new(self.num_tokens, self.dim).init(device),
             block,
-            to_logits: LinearConfig::new(self.dim, self.num_tokens)
-                .with_bias(false)
-                .init(device),
+            to_logits: (!self.tie_embeddings).then(|| {
+                LinearConfig::new(self.dim, self.num_tokens)
+                    .with_bias(false)
+                    .init(device)
+            }),
             attention_residual,
+            memory_retention_logit: self.cq_memory_decay.then(|| {
+                let probability = self.cq_memory_retention;
+                let logit = (probability / (1.0 - probability)).ln();
+                Initializer::Constant { value: logit }.init([self.heads], device)
+            }),
             dim: self.dim,
             num_tokens: self.num_tokens,
             depth: self.depth,
             heads: self.heads,
             qk_per_head,
-            rotary_dim: qk_per_head / 2,
+            rotary_dim,
             attn_residual_tied: self.attn_residual_tied,
+            tie_embeddings: self.tie_embeddings,
         })
     }
 
@@ -221,6 +260,21 @@ impl BdhConfig {
                 "Q/K features per head must be a multiple of 4 (half is pairwise RoPE)".into(),
             ));
         }
+        let rotary_dim = if self.rotary_dim == 0 {
+            qk_per_head / 2
+        } else {
+            self.rotary_dim
+        };
+        if rotary_dim > qk_per_head || !rotary_dim.is_multiple_of(2) {
+            return Err(BdhError::InvalidConfig(format!(
+                "rotary_dim must be even and no greater than Q={qk_per_head}, got {rotary_dim}"
+            )));
+        }
+        if !(0.0 < self.cq_memory_retention && self.cq_memory_retention < 1.0) {
+            return Err(BdhError::InvalidConfig(
+                "cq_memory_retention must be strictly between zero and one".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -237,13 +291,24 @@ struct BdhBlock<B: Backend> {
     proj_up: Param<Tensor<B, 3>>,
     /// `H*Q -> D` low-rank communication back to token/value space.
     proj_out: Linear<B>,
+    /// Cheap input-dependent update gate, one scalar per token and head.
+    state_update: Option<Linear<B>>,
+    /// Per-head strength of the direct neuron-state input; starts at zero.
+    state_injection: Option<Param<Tensor<B, 1>>>,
     heads: usize,
     qk_per_head: usize,
     rotary_dim: usize,
 }
 
 impl<B: Backend> BdhBlock<B> {
-    fn new(dim: usize, heads: usize, qk_per_head: usize, device: &B::Device) -> Self {
+    fn new(
+        dim: usize,
+        heads: usize,
+        qk_per_head: usize,
+        rotary_dim: usize,
+        gated_neuron_state: bool,
+        device: &B::Device,
+    ) -> Self {
         Self {
             to_qk: LinearConfig::new(dim, heads * qk_per_head)
                 .with_bias(false)
@@ -256,9 +321,15 @@ impl<B: Backend> BdhBlock<B> {
             proj_out: LinearConfig::new(heads * qk_per_head, dim)
                 .with_bias(false)
                 .init(device),
+            state_update: gated_neuron_state.then(|| {
+                LinearConfig::new(dim, heads)
+                    .with_initializer(Initializer::Zeros)
+                    .init(device)
+            }),
+            state_injection: gated_neuron_state.then(|| Initializer::Zeros.init([heads], device)),
             heads,
             qk_per_head,
-            rotary_dim: qk_per_head / 2,
+            rotary_dim,
         }
     }
 
@@ -268,16 +339,21 @@ impl<B: Backend> BdhBlock<B> {
         &self,
         tokens: Tensor<B, 3>,
         previous_memory: Option<&Tensor<B, 4>>,
+        neuron_state: Option<Tensor<B, 4>>,
         tokens_seen: usize,
-    ) -> (Tensor<B, 3>, Tensor<B, 4>) {
+    ) -> (Tensor<B, 3>, Tensor<B, 4>, Option<Tensor<B, 4>>) {
         let [batch, sequence, dim] = tokens.dims();
 
         // [B,N,D] -> [B,N,H*Q] -> [B,H,N,Q].  ReLU makes the neuron-like
         // features positive and tends to make them sparse after training.
         let sparse = activation::relu(self.to_qk.forward(tokens.clone()));
-        let gates = sparse
+        let mut gates = sparse
             .reshape([batch, sequence, self.heads, self.qk_per_head])
             .permute([0, 2, 1, 3]);
+        if let (Some(state), Some(injection)) = (&neuron_state, &self.state_injection) {
+            let strength = injection.val().reshape([1, self.heads, 1, 1]);
+            gates = activation::relu(gates + rms_norm_no_params(state.clone()) * strength);
+        }
 
         // The gate remains unrotated.  Only Q and K receive positional phase.
         let q = apply_rotary(gates.clone(), tokens_seen, self.rotary_dim);
@@ -312,10 +388,33 @@ impl<B: Backend> BdhBlock<B> {
             .repeat_dim(0, batch);
         let lifted = activation::relu(attention_out.matmul(projection) * gates);
 
-        let block_out =
-            lifted
-                .permute([0, 2, 1, 3])
-                .reshape([batch, sequence, self.heads * self.qk_per_head]);
+        // The full positive workspace is a bounded, input-dependent EMA. A
+        // single scalar gate is broadcast over Q, avoiding an infeasible
+        // `(H*Q)^2` transition while keeping every neuron coordinate alive.
+        let next_neuron_state = self.state_update.as_ref().map(|update| {
+            // A +logit(0.99) offset makes the first depth almost identical to
+            // the old stateless path: with an all-zero previous state the
+            // output is 0.99 * `lifted`, not 0.5 * `lifted`. The zero-initial
+            // weights can then learn when retaining an older wide state is
+            // useful without imposing a large scale discontinuity at step 0.
+            let write_gate = activation::sigmoid(update.forward(tokens.clone()) + 4.595_12)
+                .permute([0, 2, 1])
+                .unsqueeze_dim::<4>(3);
+            let previous = neuron_state.unwrap_or_else(|| {
+                Tensor::zeros(
+                    [batch, self.heads, sequence, self.qk_per_head],
+                    &tokens.device(),
+                )
+            });
+            previous * (1.0 - write_gate.clone()) + lifted.clone() * write_gate
+        });
+        let output_neurons = next_neuron_state.clone().unwrap_or(lifted);
+
+        let block_out = output_neurons.permute([0, 2, 1, 3]).reshape([
+            batch,
+            sequence,
+            self.heads * self.qk_per_head,
+        ]);
         let block_out = layer_norm_no_params(self.proj_out.forward(block_out));
 
         // New write for this chunk: [B,H,Q,N] @ [B,H,N,D] -> [B,H,Q,D].
@@ -326,7 +425,7 @@ impl<B: Backend> BdhBlock<B> {
         let memory_write = k.transpose().matmul(values_by_head);
         debug_assert_eq!(block_out.dims(), [batch, sequence, dim]);
 
-        (block_out, memory_write)
+        (block_out, memory_write, next_neuron_state)
     }
 }
 
@@ -476,8 +575,9 @@ pub fn compute_attn_residual_depth_bias<B: Backend>(
 pub struct Bdh<B: Backend> {
     token_embed: Embedding<B>,
     block: BdhBlock<B>,
-    to_logits: Linear<B>,
+    to_logits: Option<Linear<B>>,
     attention_residual: Option<AttentionResidual<B>>,
+    memory_retention_logit: Option<Param<Tensor<B, 1>>>,
     dim: usize,
     num_tokens: usize,
     depth: usize,
@@ -485,6 +585,7 @@ pub struct Bdh<B: Backend> {
     qk_per_head: usize,
     rotary_dim: usize,
     attn_residual_tied: bool,
+    tie_embeddings: bool,
 }
 
 impl<B: Backend> Bdh<B> {
@@ -523,6 +624,16 @@ impl<B: Backend> Bdh<B> {
         self.rotary_dim
     }
 
+    /// Whether input and output vocabulary projections share one matrix.
+    pub fn has_tied_embeddings(&self) -> bool {
+        self.tie_embeddings
+    }
+
+    /// Whether old CQ matrices use learned exponential retention.
+    pub fn has_cq_memory_decay(&self) -> bool {
+        self.memory_retention_logit.is_some()
+    }
+
     /// Device on which model parameters live.
     pub fn device(&self) -> B::Device {
         self.token_embed.weight.device()
@@ -530,7 +641,19 @@ impl<B: Backend> Bdh<B> {
 
     /// Project continuous `[B,N,D]` states into vocabulary logits.
     pub fn project_logits(&self, embeddings: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.to_logits.forward(embeddings)
+        if let Some(projection) = &self.to_logits {
+            projection.forward(embeddings)
+        } else {
+            let [batch, sequence, dim] = embeddings.dims();
+            // Flatten batch/sequence so the shared [V,D] embedding is used by
+            // one ordinary GEMM. Repeating [D,V] across B would materialize
+            // hundreds of MiB in the production microbatch.
+            (embeddings
+                .reshape([batch * sequence, dim])
+                .matmul(self.token_embed.weight.val().transpose())
+                / (dim as f64).sqrt())
+            .reshape([batch, sequence, self.num_tokens])
+        }
     }
 
     /// Embed ids and apply the same parameter-free normalization used at the
@@ -649,6 +772,9 @@ impl<B: Backend> Bdh<B> {
             None
         };
         let mut next_weights = Vec::with_capacity(self.depth);
+        // Deliberately local to this call: CQ is the only state crossing token
+        // chunks. The wide workspace exists solely across recurrent depth.
+        let mut neuron_state = None;
         let mut per_pass_hiddens = Vec::with_capacity(if options.collect_per_pass_hiddens {
             self.depth
         } else {
@@ -656,9 +782,10 @@ impl<B: Backend> Bdh<B> {
         });
 
         for (layer_index, previous) in previous_weights.into_iter().enumerate() {
-            let (block_out, memory_write) =
+            let (block_out, memory_write, next_neuron_state) =
                 self.block
-                    .forward(tokens.clone(), previous.as_ref(), tokens_seen);
+                    .forward(tokens.clone(), previous.as_ref(), neuron_state, tokens_seen);
+            neuron_state = next_neuron_state;
 
             tokens = if let (Some(residual), Some(states)) =
                 (&self.attention_residual, history.as_mut())
@@ -686,7 +813,16 @@ impl<B: Backend> Bdh<B> {
 
             let next = if options.update_memory {
                 Some(match previous {
-                    Some(old) => old + memory_write,
+                    Some(old) => {
+                        let retained = if let Some(logit) = &self.memory_retention_logit {
+                            let retention =
+                                activation::sigmoid(logit.val()).reshape([1, self.heads, 1, 1]);
+                            old * retention
+                        } else {
+                            old
+                        };
+                        retained + memory_write
+                    }
                     None => memory_write,
                 })
             } else {
@@ -721,4 +857,14 @@ fn layer_norm_no_params<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tens
     let centered = input - mean;
     let variance = centered.clone().square().mean_dim(D - 1);
     centered / (variance + 1e-5).sqrt()
+}
+
+/// RMS normalization over the last axis without affine parameters.
+///
+/// Unlike LayerNorm this preserves the sign of every coordinate; therefore a
+/// positive neuron-state stays positive before it is injected into the next
+/// recurrent block.
+fn rms_norm_no_params<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
+    let rms = (input.clone().square().mean_dim(D - 1) + f32::EPSILON as f64).sqrt();
+    input / rms
 }

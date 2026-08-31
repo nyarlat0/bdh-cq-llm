@@ -1,0 +1,57 @@
+{
+  "format_version": 2,
+  "tokenizer": "artifacts/tokenizer-v2-24576.json",
+  "packed_dir": "datasets/packed/rx6700-v2-24576",
+  "run_dir": "runs/rx6700-v2-pilot-state",
+  "seed": 42,
+  "sequence_length": 256,
+  "block_sequences": 256,
+  "sources": {
+    "fineweb2_hq": { "train_tokens": 650000000, "validation_tokens": 1000000 },
+    "ficbook":     { "train_tokens": 300000000, "validation_tokens": 1000000 },
+    "ru_classic":  { "train_tokens":  50000000, "validation_tokens": 1000000 }
+  },
+  "ficbook_phase_one_tokens": 50000000,
+  "focus_replay": {
+    "fineweb2_hq_tokens": 40000000,
+    "ru_classic_tokens": 10000000
+  },
+  "model": {
+    "dim": 512,
+    "depth": 8,
+    "heads": 8,
+    "dim_qk_heads": 6144,
+    "rotary_dim": 64,
+    "tie_embeddings": true,
+    "attn_residual": false,
+    "attn_residual_tied": true,
+    "attn_residual_depth_bias_distance": 0,
+    "gated_neuron_state": true,
+    "cq_memory_decay": true,
+    "cq_memory_retention": 0.995
+  },
+  "optimizer": {
+    "micro_batch_size": 4,
+    "gradient_accumulation": 16,
+    "max_learning_rate": 0.0003,
+    "min_learning_rate": 0.00008,
+    "warmup_tokens": 10000000,
+    "focus_max_learning_rate": 0.00012,
+    "focus_min_learning_rate": 0.00003,
+    "focus_warmup_tokens": 5000000,
+    "beta_1": 0.9,
+    "beta_2": 0.95,
+    "weight_decay": 0.1,
+    "gradient_clip_norm": 1.0
+  },
+  "memory": {
+    "stateful_after_tokens": 5000000,
+    "chunks_per_detach": 8,
+    "reset_on_document": true,
+    "reset_on_work_block": true
+  },
+  "checkpoint_every_steps": 125,
+  "validation_every_steps": 125,
+  "validation_batches": 384,
+  "log_every_steps": 10
+}

@@ -125,6 +125,14 @@ fn main() -> Result<(), AnyError> {
         .with_depth(config.model.depth)
         .with_heads(config.model.heads)
         .with_dim_qk_heads(config.model.dim_qk_heads)
+        .with_rotary_dim(config.model.rotary_dim)
+        .with_tie_embeddings(config.model.tie_embeddings)
+        .with_attn_residual(config.model.attn_residual)
+        .with_attn_residual_tied(config.model.attn_residual_tied)
+        .with_attn_residual_depth_bias_distance(config.model.attn_residual_depth_bias_distance)
+        .with_gated_neuron_state(config.model.gated_neuron_state)
+        .with_cq_memory_decay(config.model.cq_memory_decay)
+        .with_cq_memory_retention(config.model.cq_memory_retention)
         .init::<TrainingBackend>(&device)?;
     let recorder = CheckpointRecorder::default();
     let record = recorder.load(checkpoint.join("model"), &device)?;

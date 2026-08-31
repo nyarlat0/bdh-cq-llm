@@ -47,11 +47,17 @@ The maximum learned token length is 64 bytes so that a long URL or repeated web
 identifier cannot consume a vocabulary entry. Input itself is never truncated
 by this limit.
 
-The default vocabulary is 32,768 entries. For a small language model this is a
+The legacy/default vocabulary is 32,768 entries. For a small language model this is a
 reasonable compromise between Russian compression and the parameter cost of
 the embedding/output matrices. Do not increase it solely because more corpus is
 available; compare held-out fertility (tokens per character/word), compression,
 and downstream validation loss first.
+
+Architecture v2 deliberately uses 24,576 entries and ties input/output
+embeddings. At `D=512` this keeps the vocabulary matrix at 12.58M parameters
+and moves the saved capacity into the recurrent body. It is a new tokenizer
+ABI; v1 token shards and checkpoints cannot be reused. The exact v2 wrapper is
+[`scripts/prepare_v2_data.sh`](../scripts/prepare_v2_data.sh).
 
 ## Reserved IDs
 
