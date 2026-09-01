@@ -22,11 +22,52 @@ use crate::{error::BdhError, rope::apply_rotary};
 /// layer has ever received a token.
 pub type FastWeight<B> = Option<Tensor<B, 4>>;
 
+/// Wide neuron workspace carried only by consecutive latent reasoning steps.
+///
+/// This state has layout `[B,H,1,Q]`.  It is intentionally separate from
+/// [`Memory`]: token-aligned `[B,H,N,Q]` activations must not cross ordinary
+/// chunk boundaries, while a one-position `Think` chain can safely reuse its
+/// wide computational state across outer reasoning iterations.
+#[derive(Clone, Debug, Default)]
+pub struct LatentWorkspace<B: Backend> {
+    neuron_state: Option<Tensor<B, 4>>,
+}
+
+impl<B: Backend> LatentWorkspace<B> {
+    /// Start an independent latent reasoning chain with no wide state.
+    pub fn new() -> Self {
+        Self { neuron_state: None }
+    }
+
+    /// Whether a completed latent iteration has populated the wide state.
+    pub fn has_neuron_state(&self) -> bool {
+        self.neuron_state.is_some()
+    }
+
+    /// Shape of the current wide state, when initialized.
+    pub fn neuron_state_dims(&self) -> Option<[usize; 4]> {
+        self.neuron_state.as_ref().map(Tensor::dims)
+    }
+
+    /// Read the wide state without making it part of persistent CQ memory.
+    pub fn neuron_state(&self) -> Option<&Tensor<B, 4>> {
+        self.neuron_state.as_ref()
+    }
+
+    /// Cut autograd history at an explicit caller-selected reasoning boundary.
+    pub fn detach(self) -> Self {
+        Self {
+            neuron_state: self.neuron_state.map(Tensor::detach),
+        }
+    }
+}
+
 /// Persistent state carried between token chunks and latent-reasoning passes.
 ///
-/// The paper's contextual state `S_t` corresponds primarily to
-/// [`fast_weights`](Self::fast_weights).  [`embeds`](Self::embeds) is different:
-/// it is the most recent model output and seeds the latent workspace `H_0`.
+/// The paper's contextual state corresponds primarily to
+/// [`fast_weights`](Self::fast_weights), denoted `M` in this crate to avoid
+/// confusion with v2's wide neuron state `S`. [`embeds`](Self::embeds) is
+/// different: it is the most recent narrow output and seeds latent `H_0`.
 #[derive(Clone, Debug)]
 pub struct Memory<B: Backend> {
     /// Sequence positions processed independently by every batch row.
@@ -220,16 +261,28 @@ pub struct BdhConfig {
     /// Number of learnable cycle-distance bias values; zero disables the bias.
     #[config(default = 0)]
     pub attn_residual_depth_bias_distance: usize,
-    /// Carry the full `[B,H,N,Q]` positive workspace across recurrent depth.
+    /// Carry a distinct full `[B,H,N,Q]` delta-state across recurrent depth.
     #[config(default = false)]
     pub gated_neuron_state: bool,
-    /// Initial fraction of the newly computed full neuron state.
+    /// Initial fraction used to move an existing state toward a new candidate.
     #[config(default = 0.2)]
     pub gated_neuron_state_initial_update: f64,
+    /// Initial bounded strength of direct wide-state injection into Q/K gates.
+    ///
+    /// Legacy configurations default to zero. Architecture-v2 configs set a
+    /// small non-zero value so the path is active without dominating `W_qk X`.
+    #[config(default = 0.0)]
+    pub gated_neuron_state_initial_injection: f64,
+    /// Normalize the narrow `[B,N,D]` stream after every recurrent depth.
+    ///
+    /// This is enabled by architecture v2. The default is false so the public
+    /// reconstruction retains its original single final normalization.
+    #[config(default = false)]
+    pub normalize_each_depth: bool,
     /// Exponentially retain old CQ fast weights before adding the new write.
     #[config(default = false)]
     pub cq_memory_decay: bool,
-    /// Initial per-head CQ retention when decay is enabled.
+    /// Initial per-neuron CQ retention when decay is enabled.
     #[config(default = 0.995)]
     pub cq_memory_initial_rho: f64,
 }
@@ -252,6 +305,7 @@ impl BdhConfig {
             rotary_dim,
             self.gated_neuron_state,
             self.gated_neuron_state_initial_update,
+            self.gated_neuron_state_initial_injection,
             device,
         );
         let attention_residual = self.attn_residual.then(|| {
@@ -281,7 +335,7 @@ impl BdhConfig {
             raw_rho: self.cq_memory_decay.then(|| {
                 let probability = self.cq_memory_initial_rho;
                 let logit = (probability / (1.0 - probability)).ln();
-                Initializer::Constant { value: logit }.init([self.heads], device)
+                Initializer::Constant { value: logit }.init([self.heads, qk_per_head], device)
             }),
             dim: self.dim,
             num_tokens: self.num_tokens,
@@ -292,6 +346,7 @@ impl BdhConfig {
             attn_residual_tied: self.attn_residual_tied,
             attn_residual_heads: self.attn_residual_heads,
             tie_embeddings: self.tie_embeddings,
+            normalize_each_depth: self.normalize_each_depth,
         })
     }
 
@@ -344,6 +399,13 @@ impl BdhConfig {
                 "gated_neuron_state_initial_update must be strictly between zero and one".into(),
             ));
         }
+        if !(-1.0 < self.gated_neuron_state_initial_injection
+            && self.gated_neuron_state_initial_injection < 1.0)
+        {
+            return Err(BdhError::InvalidConfig(
+                "gated_neuron_state_initial_injection must be strictly between -1 and 1".into(),
+            ));
+        }
         if !(0.0 < self.cq_memory_initial_rho && self.cq_memory_initial_rho < 1.0) {
             return Err(BdhError::InvalidConfig(
                 "cq_memory_initial_rho must be strictly between zero and one".into(),
@@ -367,10 +429,10 @@ struct BdhBlock<B: Backend> {
     proj_out: Linear<B>,
     /// Cheap input-dependent update gate, one scalar per token and head.
     state_update: Option<Linear<B>>,
-    /// Per-head unconstrained base logit for the full-state update fraction.
-    raw_state_update: Option<Param<Tensor<B, 1>>>,
-    /// Per-head strength of the direct neuron-state input; starts at zero.
-    state_injection: Option<Param<Tensor<B, 1>>>,
+    /// Per-neuron unconstrained base logit for the full-state update fraction.
+    raw_state_update: Option<Param<Tensor<B, 2>>>,
+    /// Per-neuron unconstrained direct-state injection, bounded with `tanh`.
+    raw_state_injection: Option<Param<Tensor<B, 2>>>,
     heads: usize,
     qk_per_head: usize,
     rotary_dim: usize,
@@ -384,6 +446,7 @@ impl<B: Backend> BdhBlock<B> {
         rotary_dim: usize,
         gated_neuron_state: bool,
         gated_neuron_state_initial_update: f64,
+        gated_neuron_state_initial_injection: f64,
         device: &B::Device,
     ) -> Self {
         Self {
@@ -407,9 +470,12 @@ impl<B: Backend> BdhBlock<B> {
             raw_state_update: gated_neuron_state.then(|| {
                 let probability = gated_neuron_state_initial_update;
                 let logit = (probability / (1.0 - probability)).ln();
-                Initializer::Constant { value: logit }.init([heads], device)
+                Initializer::Constant { value: logit }.init([heads, qk_per_head], device)
             }),
-            state_injection: gated_neuron_state.then(|| Initializer::Zeros.init([heads], device)),
+            raw_state_injection: gated_neuron_state.then(|| {
+                let raw = gated_neuron_state_initial_injection.atanh();
+                Initializer::Constant { value: raw }.init([heads, qk_per_head], device)
+            }),
             heads,
             qk_per_head,
             rotary_dim,
@@ -424,19 +490,31 @@ impl<B: Backend> BdhBlock<B> {
         previous_memory: Option<&Tensor<B, 4>>,
         neuron_state: Option<Tensor<B, 4>>,
         metadata: &SequenceMetadata<B>,
-    ) -> (Tensor<B, 3>, Tensor<B, 4>, Option<Tensor<B, 4>>) {
+    ) -> BdhBlockOutput<B> {
         let [batch, sequence, dim] = tokens.dims();
 
-        // [B,N,D] -> [B,N,H*Q] -> [B,H,N,Q].  ReLU makes the neuron-like
-        // features positive and tends to make them sparse after training.
-        let sparse = activation::relu(self.to_qk.forward(tokens.clone()));
-        let mut gates = sparse
+        // [B,N,D] -> [B,N,H*Q] -> [B,H,N,Q].  When a previous wide state is
+        // available it is injected into the raw projection before the single
+        // ReLU, exactly as G = ReLU(W_qk X + alpha * RMS(S_prev)).  The
+        // state-free/legacy path therefore remains G = ReLU(W_qk X).
+        let projected = self
+            .to_qk
+            .forward(tokens.clone())
             .reshape([batch, sequence, self.heads, self.qk_per_head])
             .permute([0, 2, 1, 3]);
-        if let (Some(state), Some(injection)) = (&neuron_state, &self.state_injection) {
-            let strength = injection.val().reshape([1, self.heads, 1, 1]);
-            gates = activation::relu(gates + rms_norm_no_params(state.clone()) * strength);
-        }
+        let gates = if let (Some(state), Some(raw_injection)) =
+            (&neuron_state, &self.raw_state_injection)
+        {
+            inject_wide_state(
+                projected,
+                state.clone(),
+                raw_injection.val(),
+                self.heads,
+                self.qk_per_head,
+            )
+        } else {
+            activation::relu(projected)
+        };
 
         // The gate remains unrotated.  Only Q and K receive positional phase.
         let q = apply_rotary(gates.clone(), &metadata.position_ids, self.rotary_dim);
@@ -481,39 +559,40 @@ impl<B: Backend> BdhBlock<B> {
             .repeat_dim(0, batch);
         let lifted = activation::relu(attention_out.matmul(projection) * gates);
 
-        // The full positive workspace is a bounded, input-dependent EMA. A
-        // single scalar gate is broadcast over Q, avoiding an infeasible
-        // `(H*Q)^2` transition while keeping every neuron coordinate alive.
-        let next_neuron_state = self.state_update.as_ref().map(|update| {
-            // u is the fraction of newly computed state:
-            // S_l = (1 - u) S_(l-1) + u Z_l. The input projection starts at
-            // zero and `raw_state_update` starts at logit(0.2), so every head
-            // initially keeps 80% of its prior wide state and writes 20% new.
-            let raw_update = self
-                .raw_state_update
-                .as_ref()
-                .expect("state gate parameters are initialized together")
-                .val()
-                .reshape([1, 1, self.heads]);
-            let write_gate = activation::sigmoid(update.forward(tokens.clone()) + raw_update)
-                .permute([0, 2, 1])
-                .unsqueeze_dim::<4>(3);
-            let previous = neuron_state.unwrap_or_else(|| {
-                Tensor::zeros(
-                    [batch, self.heads, sequence, self.qk_per_head],
-                    &tokens.device(),
-                )
-            });
-            previous * (1.0 - write_gate.clone()) + lifted.clone() * write_gate
-        });
-        let output_neurons = next_neuron_state.clone().unwrap_or(lifted);
+        // The persistent wide state and the information communicated through
+        // narrow D are distinct. With no previous state the first candidate
+        // is accepted whole. Later depths form the bounded delta
+        //   DeltaS = u * (Z - S_prev); S_next = S_prev + DeltaS.
+        // Only DeltaS is projected by W_out, so an old S is never re-added by
+        // the ordinary residual or by Attention Residual history.
+        let (neuron_delta, next_neuron_state) = if let Some(update) = &self.state_update {
+            match neuron_state {
+                None => {
+                    let (delta, state) = wide_state_transition(lifted, None, None);
+                    (delta, Some(state))
+                }
+                Some(previous) => {
+                    let token_bias = update
+                        .forward(tokens.clone())
+                        .permute([0, 2, 1])
+                        .unsqueeze_dim::<4>(3);
+                    let base = self
+                        .raw_state_update
+                        .as_ref()
+                        .expect("state gate parameters are initialized together")
+                        .val();
+                    let write_gate =
+                        per_neuron_update_gate(token_bias, base, self.heads, self.qk_per_head);
+                    let (delta, state) =
+                        wide_state_transition(lifted, Some(previous), Some(write_gate));
+                    (delta, Some(state))
+                }
+            }
+        } else {
+            (lifted, None)
+        };
 
-        let block_out = output_neurons.permute([0, 2, 1, 3]).reshape([
-            batch,
-            sequence,
-            self.heads * self.qk_per_head,
-        ]);
-        let block_out = layer_norm_no_params(self.proj_out.forward(block_out));
+        let block_out = self.project_neuron_delta(neuron_delta.clone());
 
         // New write for this chunk: [B,H,Q,N] @ [B,H,N,D] -> [B,H,Q,D].
         // The optional mask keeps only the final document represented in this
@@ -528,8 +607,75 @@ impl<B: Backend> BdhBlock<B> {
         let memory_write = k.transpose().matmul(values_for_memory);
         debug_assert_eq!(block_out.dims(), [batch, sequence, dim]);
 
-        (block_out, memory_write, next_neuron_state)
+        BdhBlockOutput {
+            block_out,
+            memory_write,
+            neuron_state: next_neuron_state,
+            #[cfg(test)]
+            neuron_delta,
+        }
     }
+
+    /// Compress only this depth's state change into the narrow D channel.
+    fn project_neuron_delta(&self, delta: Tensor<B, 4>) -> Tensor<B, 3> {
+        let [batch, _, sequence, _] = delta.dims();
+        let delta =
+            delta
+                .permute([0, 2, 1, 3])
+                .reshape([batch, sequence, self.heads * self.qk_per_head]);
+        layer_norm_no_params(self.proj_out.forward(delta))
+    }
+}
+
+/// Internal result of one application of the shared block.
+///
+/// Keeping `neuron_delta` separate from `neuron_state` makes the architectural
+/// invariant explicit: only the former may flow through `proj_out`.
+struct BdhBlockOutput<B: Backend> {
+    block_out: Tensor<B, 3>,
+    memory_write: Tensor<B, 4>,
+    neuron_state: Option<Tensor<B, 4>>,
+    #[cfg(test)]
+    neuron_delta: Tensor<B, 4>,
+}
+
+/// Apply the v2 delta-state recurrence to synthetic or model-produced tensors.
+fn wide_state_transition<B: Backend>(
+    candidate: Tensor<B, 4>,
+    previous: Option<Tensor<B, 4>>,
+    update: Option<Tensor<B, 4>>,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    match previous {
+        None => (candidate.clone(), candidate),
+        Some(previous) => {
+            let update = update.expect("an existing wide state requires an update gate");
+            let delta = update * (candidate - previous.clone());
+            let state = previous + delta.clone();
+            (delta, state)
+        }
+    }
+}
+
+/// Combine cheap `[B,H,N,1]` input bias with a learned `[H,Q]` baseline.
+fn per_neuron_update_gate<B: Backend>(
+    token_bias: Tensor<B, 4>,
+    raw_base: Tensor<B, 2>,
+    heads: usize,
+    qk_per_head: usize,
+) -> Tensor<B, 4> {
+    activation::sigmoid(token_bias + raw_base.reshape([1, heads, 1, qk_per_head]))
+}
+
+/// Inject the previous full wide state without an `H*Q -> H*Q` transition.
+fn inject_wide_state<B: Backend>(
+    projected: Tensor<B, 4>,
+    state: Tensor<B, 4>,
+    raw_strength: Tensor<B, 2>,
+    heads: usize,
+    qk_per_head: usize,
+) -> Tensor<B, 4> {
+    let strength = raw_strength.tanh().reshape([1, heads, 1, qk_per_head]);
+    activation::relu(projected + rms_norm_no_params(state) * strength)
 }
 
 /// Multi-head attention over earlier depth and latent states.
@@ -701,7 +847,7 @@ pub struct Bdh<B: Backend> {
     block: BdhBlock<B>,
     to_logits: Option<Linear<B>>,
     attention_residual: Option<MultiHeadAttentionResidual<B>>,
-    raw_rho: Option<Param<Tensor<B, 1>>>,
+    raw_rho: Option<Param<Tensor<B, 2>>>,
     dim: usize,
     num_tokens: usize,
     depth: usize,
@@ -711,6 +857,7 @@ pub struct Bdh<B: Backend> {
     attn_residual_tied: bool,
     attn_residual_heads: usize,
     tie_embeddings: bool,
+    normalize_each_depth: bool,
 }
 
 /// Per-token masks derived once and reused by every recurrent depth.
@@ -898,22 +1045,41 @@ impl<B: Backend> Bdh<B> {
             .map_or(0, |_| self.attn_residual_heads)
     }
 
-    /// Learned per-CQ-head retention probabilities `sigmoid(raw_rho)`.
-    pub fn cq_retention_probabilities(&self) -> Option<Tensor<B, 1>> {
+    /// Learned per-neuron CQ retention probabilities `sigmoid(raw_rho)`.
+    ///
+    /// The returned layout is `[H,Q]`; logs should summarize it rather than
+    /// printing every neuron coordinate.
+    pub fn cq_retention_probabilities(&self) -> Option<Tensor<B, 2>> {
         self.raw_rho
             .as_ref()
             .map(|raw_rho| activation::sigmoid(raw_rho.val()))
     }
 
-    /// Learned per-head base update probabilities `sigmoid(raw_u)`.
+    /// Learned per-neuron base update probabilities `sigmoid(raw_u)`.
     ///
     /// The token-dependent projection is not included: this diagnostic tracks
     /// whether the learned baseline drifts or saturates during a long run.
-    pub fn base_state_update_probabilities(&self) -> Option<Tensor<B, 1>> {
+    pub fn base_state_update_probabilities(&self) -> Option<Tensor<B, 2>> {
         self.block
             .raw_state_update
             .as_ref()
             .map(|raw_update| activation::sigmoid(raw_update.val()))
+    }
+
+    /// Bounded per-neuron wide-state injection strengths `tanh(raw_alpha)`.
+    ///
+    /// The returned layout is `[H,Q]` and matches the wide workspace's final
+    /// two axes exactly.
+    pub fn state_injection_strengths(&self) -> Option<Tensor<B, 2>> {
+        self.block
+            .raw_state_injection
+            .as_ref()
+            .map(|raw_injection| raw_injection.val().tanh())
+    }
+
+    /// Whether the narrow stream is normalized after each recurrent depth.
+    pub fn normalizes_each_depth(&self) -> bool {
+        self.normalize_each_depth
     }
 
     /// Device on which model parameters live.
@@ -964,6 +1130,45 @@ impl<B: Backend> Bdh<B> {
         memory: Option<Memory<B>>,
         options: BdhForwardOptions<B>,
     ) -> Result<BdhOutput<B>, BdhError> {
+        let (output, _) = self.forward_internal(input, memory, None, options)?;
+        Ok(output)
+    }
+
+    /// Process one `[B,1,D]` latent iteration while carrying its wide state.
+    ///
+    /// This is deliberately separate from [`forward`](Self::forward). Normal
+    /// token passes always reset the token-aligned wide workspace; only a
+    /// caller that is explicitly executing one latent reasoning chain can
+    /// return the `[B,H,1,Q]` state to the next outer iteration.
+    pub fn forward_latent(
+        &self,
+        latent: Tensor<B, 3>,
+        memory: Option<Memory<B>>,
+        workspace: LatentWorkspace<B>,
+        options: BdhForwardOptions<B>,
+    ) -> Result<(BdhOutput<B>, LatentWorkspace<B>), BdhError> {
+        let [_, sequence, _] = latent.dims();
+        if sequence != 1 {
+            return Err(BdhError::InvalidStages(format!(
+                "latent wide-state recurrence requires N=1, got N={sequence}"
+            )));
+        }
+        let (output, neuron_state) = self.forward_internal(
+            ModelInput::Embeddings(latent),
+            memory,
+            workspace.neuron_state,
+            options,
+        )?;
+        Ok((output, LatentWorkspace { neuron_state }))
+    }
+
+    fn forward_internal(
+        &self,
+        input: ModelInput<B>,
+        memory: Option<Memory<B>>,
+        initial_neuron_state: Option<Tensor<B, 4>>,
+        options: BdhForwardOptions<B>,
+    ) -> Result<(BdhOutput<B>, Option<Tensor<B, 4>>), BdhError> {
         let mut tokens = match input {
             ModelInput::TokenIds(ids) => self.embed_tokens(ids),
             ModelInput::Embeddings(embeddings) => {
@@ -982,6 +1187,15 @@ impl<B: Backend> Bdh<B> {
             return Err(BdhError::InvalidStages(
                 "a model pass cannot contain an empty sequence".into(),
             ));
+        }
+        if let Some(state) = &initial_neuron_state {
+            let expected = [batch, self.heads, sequence, self.qk_per_head];
+            if state.dims() != expected {
+                return Err(BdhError::InvalidStages(format!(
+                    "latent neuron workspace must have shape {expected:?}, got {:?}",
+                    state.dims()
+                )));
+            }
         }
         let valid_sequence_length = options.valid_sequence_length.unwrap_or(sequence);
         if valid_sequence_length == 0 || valid_sequence_length > sequence {
@@ -1068,9 +1282,10 @@ impl<B: Backend> Bdh<B> {
             None
         };
         let mut next_weights = Vec::with_capacity(self.depth);
-        // Deliberately local to this call: CQ is the only state crossing token
-        // chunks. The wide workspace exists solely across recurrent depth.
-        let mut neuron_state = None;
+        // Ordinary `forward` supplies None, so token-aligned wide state never
+        // crosses chunks. `forward_latent` may explicitly supply `[B,H,1,Q]`
+        // from the preceding iteration of the same Think chain.
+        let mut neuron_state = initial_neuron_state;
         let mut per_pass_hiddens = Vec::with_capacity(if options.collect_per_pass_hiddens {
             self.depth
         } else {
@@ -1078,12 +1293,17 @@ impl<B: Backend> Bdh<B> {
         });
 
         for (layer_index, previous) in previous_weights.into_iter().enumerate() {
-            let (block_out, memory_write, next_neuron_state) =
-                self.block
-                    .forward(tokens.clone(), previous.as_ref(), neuron_state, &metadata);
+            let BdhBlockOutput {
+                block_out,
+                memory_write,
+                neuron_state: next_neuron_state,
+                ..
+            } = self
+                .block
+                .forward(tokens.clone(), previous.as_ref(), neuron_state, &metadata);
             neuron_state = next_neuron_state;
 
-            tokens = if let (Some(residual), Some(states)) =
+            let next_tokens = if let (Some(residual), Some(states)) =
                 (&self.attention_residual, history.as_mut())
             {
                 states.push(block_out);
@@ -1102,6 +1322,11 @@ impl<B: Backend> Bdh<B> {
             } else {
                 tokens + block_out
             };
+            tokens = if self.normalize_each_depth {
+                layer_norm_no_params(next_tokens)
+            } else {
+                next_tokens
+            };
 
             if options.collect_per_pass_hiddens {
                 per_pass_hiddens.push(tokens.clone());
@@ -1116,9 +1341,12 @@ impl<B: Backend> Bdh<B> {
                             old
                         };
                         let retained = if let Some(raw_rho) = &self.raw_rho {
-                            let retention =
-                                activation::sigmoid(raw_rho.val()).reshape([1, self.heads, 1, 1]);
-                            old * retention
+                            retain_cq_per_neuron(
+                                old,
+                                activation::sigmoid(raw_rho.val()),
+                                self.heads,
+                                self.qk_per_head,
+                            )
                         } else {
                             old
                         };
@@ -1138,14 +1366,16 @@ impl<B: Backend> Bdh<B> {
             next_weights.push(next);
         }
 
-        // Unlike a Transformer pre-norm block, upstream applies this only once
-        // after all recurrent depths.
+        // The public reconstruction always applies this final normalization.
+        // V2 additionally normalizes each intermediate recurrent transition;
+        // retaining the final pass keeps logits and Memory.embeds on the same
+        // stable contract in both modes.
         let embeddings = layer_norm_no_params(tokens);
         let logits = options
             .return_logits
             .then(|| self.project_logits(embeddings.clone()));
 
-        Ok(BdhOutput {
+        let output = BdhOutput {
             logits,
             memory: Memory {
                 position_offsets: metadata.next_position_offsets,
@@ -1154,7 +1384,8 @@ impl<B: Backend> Bdh<B> {
             },
             per_pass_hiddens,
             attention_history: history,
-        })
+        };
+        Ok((output, neuron_state))
     }
 }
 
@@ -1174,4 +1405,194 @@ fn layer_norm_no_params<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tens
 fn rms_norm_no_params<B: Backend, const D: usize>(input: Tensor<B, D>) -> Tensor<B, D> {
     let rms = (input.clone().square().mean_dim(D - 1) + f32::EPSILON as f64).sqrt();
     input / rms
+}
+
+/// Apply `[H,Q]` retention independently to the matching CQ coordinates.
+fn retain_cq_per_neuron<B: Backend>(
+    memory: Tensor<B, 4>,
+    retention: Tensor<B, 2>,
+    heads: usize,
+    qk_per_head: usize,
+) -> Tensor<B, 4> {
+    memory * retention.reshape([1, heads, qk_per_head, 1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::{
+        backend::NdArray,
+        tensor::{TensorData, Tolerance},
+    };
+
+    type TestBackend = NdArray<f32>;
+
+    #[test]
+    fn wide_delta_transition_matches_the_v2_equations() {
+        let device = Default::default();
+        let candidate = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![2.0_f32, 4.0, 8.0], [1, 1, 1, 3]),
+            &device,
+        );
+        let previous = Tensor::from_data(
+            TensorData::new(vec![1.0_f32, 2.0, 10.0], [1, 1, 1, 3]),
+            &device,
+        );
+        let update = Tensor::from_data(
+            TensorData::new(vec![0.5_f32, 0.25, 0.1], [1, 1, 1, 3]),
+            &device,
+        );
+
+        let (delta, state) = wide_state_transition(candidate, Some(previous), Some(update));
+        delta.into_data().assert_approx_eq::<f32>(
+            &TensorData::new(vec![0.5_f32, 0.5, -0.2], [1, 1, 1, 3]),
+            Tolerance::absolute(1e-6),
+        );
+        state.into_data().assert_approx_eq::<f32>(
+            &TensorData::new(vec![1.5_f32, 2.5, 9.8], [1, 1, 1, 3]),
+            Tolerance::absolute(1e-6),
+        );
+    }
+
+    #[test]
+    fn first_wide_depth_accepts_the_complete_candidate() {
+        let device = Default::default();
+        let candidate = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(vec![2.0_f32, 4.0, 8.0], [1, 1, 1, 3]),
+            &device,
+        );
+        let (delta, state) = wide_state_transition(candidate.clone(), None, None);
+        delta
+            .into_data()
+            .assert_approx_eq::<f32>(&candidate.to_data(), Tolerance::absolute(0.0));
+        state
+            .into_data()
+            .assert_approx_eq::<f32>(&candidate.into_data(), Tolerance::absolute(0.0));
+    }
+
+    #[test]
+    fn actual_first_block_state_and_delta_are_identical() {
+        let device = Default::default();
+        TestBackend::seed(&device, 92);
+        let block = BdhBlock::<TestBackend>::new(8, 2, 4, 2, true, 0.2, 0.05, &device);
+        let tokens = Tensor::from_data(
+            TensorData::new(
+                (0..16).map(|value| value as f32 / 11.0).collect(),
+                [1, 2, 8],
+            ),
+            &device,
+        );
+        let metadata = sequence_metadata(1, 2, 2, &[0], None, &device).unwrap();
+        let output = block.forward(tokens, None, None, &metadata);
+        output.neuron_delta.into_data().assert_approx_eq::<f32>(
+            &output
+                .neuron_state
+                .expect("gated state is enabled")
+                .into_data(),
+            Tolerance::absolute(0.0),
+        );
+    }
+
+    #[test]
+    fn block_output_projects_delta_instead_of_accumulated_state() {
+        let device = Default::default();
+        TestBackend::seed(&device, 91);
+        let block = BdhBlock::<TestBackend>::new(8, 2, 4, 2, true, 0.2, 0.05, &device);
+        let tokens = Tensor::from_data(
+            TensorData::new(
+                (0..16).map(|value| value as f32 / 7.0 - 1.0).collect(),
+                [1, 2, 8],
+            ),
+            &device,
+        );
+        let previous = Tensor::ones([1, 2, 2, 4], &device);
+        let metadata = sequence_metadata(1, 2, 2, &[0], None, &device).unwrap();
+        let output = block.forward(tokens, None, Some(previous), &metadata);
+
+        let projected_delta = block.project_neuron_delta(output.neuron_delta.clone());
+        output
+            .block_out
+            .clone()
+            .into_data()
+            .assert_approx_eq::<f32>(&projected_delta.into_data(), Tolerance::absolute(0.0));
+        let projected_state =
+            block.project_neuron_delta(output.neuron_state.expect("gated state is enabled"));
+        let delta_values = output.block_out.into_data().to_vec::<f32>().unwrap();
+        let state_values = projected_state.into_data().to_vec::<f32>().unwrap();
+        assert!(
+            delta_values
+                .iter()
+                .zip(state_values)
+                .any(|(delta, state)| (*delta - state).abs() > 1e-4),
+            "projecting S_next unexpectedly matched projecting DeltaS"
+        );
+    }
+
+    #[test]
+    fn cq_retention_broadcasts_independently_over_every_neuron() {
+        let device = Default::default();
+        let memory = Tensor::<TestBackend, 4>::ones([1, 2, 3, 2], &device);
+        let retention = Tensor::from_data(
+            TensorData::new(vec![0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], [2, 3]),
+            &device,
+        );
+        let retained = retain_cq_per_neuron(memory, retention, 2, 3);
+        retained.into_data().assert_approx_eq::<f32>(
+            &TensorData::new(
+                vec![
+                    0.1_f32, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4, 0.5, 0.5, 0.6, 0.6,
+                ],
+                [1, 2, 3, 2],
+            ),
+            Tolerance::absolute(1e-6),
+        );
+    }
+
+    #[test]
+    fn update_and_injection_broadcast_per_neuron_across_tokens() {
+        let device = Default::default();
+        let probabilities = [0.1_f32, 0.2, 0.3, 0.6, 0.7, 0.8];
+        let raw_update = probabilities
+            .iter()
+            .map(|probability| (probability / (1.0 - probability)).ln())
+            .collect::<Vec<_>>();
+        let gate = per_neuron_update_gate(
+            Tensor::<TestBackend, 4>::zeros([1, 2, 2, 1], &device),
+            Tensor::from_data(TensorData::new(raw_update, [2, 3]), &device),
+            2,
+            3,
+        );
+        assert_eq!(gate.dims(), [1, 2, 2, 3]);
+        gate.into_data().assert_approx_eq::<f32>(
+            &TensorData::new(
+                vec![
+                    0.1_f32, 0.2, 0.3, 0.1, 0.2, 0.3, 0.6, 0.7, 0.8, 0.6, 0.7, 0.8,
+                ],
+                [1, 2, 2, 3],
+            ),
+            Tolerance::absolute(1e-6),
+        );
+
+        let strengths = [0.01_f32, 0.02, 0.03, 0.04, 0.05, 0.06];
+        let raw_strengths = strengths
+            .iter()
+            .map(|value| value.atanh())
+            .collect::<Vec<_>>();
+        let injected = inject_wide_state(
+            Tensor::<TestBackend, 4>::zeros([1, 2, 2, 3], &device),
+            Tensor::ones([1, 2, 2, 3], &device),
+            Tensor::from_data(TensorData::new(raw_strengths, [2, 3]), &device),
+            2,
+            3,
+        );
+        injected.into_data().assert_approx_eq::<f32>(
+            &TensorData::new(
+                vec![
+                    0.01_f32, 0.02, 0.03, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.04, 0.05, 0.06,
+                ],
+                [1, 2, 2, 3],
+            ),
+            Tolerance::absolute(1e-6),
+        );
+    }
 }

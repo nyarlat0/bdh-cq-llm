@@ -24,7 +24,10 @@ It is easy to accidentally treat three different things as one model:
 
 This crate implements item 3, uses item 1 to explain why the construction
 makes architectural sense, and uses item 2 to name the contextual and latent
-state roles.
+state roles. Architecture v2 is a fourth, explicitly experimental layer on
+top: delta-form wide state, per-neuron timescales/injection/retention,
+depth-local normalization and MHAR are project hypotheses, not published
+Pathway BDH-CQ mechanisms.
 
 ## 2. Shape glossary
 
@@ -55,7 +58,7 @@ demonstration/query ids D_t
           │ apply the same BDH block L times
           │ each depth reads and optionally writes its own M_l
           ▼
- latest hidden sequence + contextual state S = {M_0 ... M_(L-1)}
+ latest hidden sequence + contextual CQ state M = {M_0 ... M_(L-1)}
           │
           ├── last position becomes one-position latent workspace H [B,1,D]
           │        │
@@ -158,8 +161,8 @@ The current chunk proposes:
 ```text
 ΔM_l = K_rot^T V                           [B,H,Q,D]
 M_l' = M_l + ΔM_l                          legacy additive update
-ρ_h = sigmoid(raw_ρ_h)
-M_l' = ρ_h M_l + ΔM_l                      optional v2 learned decay
+ρ_(h,q) = sigmoid(raw_ρ_(h,q))
+M_l' = ρ ⊙ M_l + ΔM_l                      optional v2 learned decay
 M_l' = M_l                                 when update_memory = false
 ```
 
@@ -180,32 +183,73 @@ uses one unpadded `[B,256]` call.
 
 ### 4.5 Recurrent residual
 
-Normally:
+The legacy/public-reconstruction path uses:
 
 ```text
 X_(l+1) = X_l + Y_l
 ```
 
-After `L` shared-block applications the output receives one final
-parameter-free LayerNorm. The optional Attention Residual replaces the
-identity branch `X_l` with a learned mixture of saved earlier depth/reasoning
-states. Multi-Head Attention Residual divides `D` into contiguous feature
-subspaces and gives each one an independent softmax distribution over saved
-depths. Full-width RMSNorm is applied before the split, the learned query is
-zero-initialized, and H=1 exactly recovers the older single-query router. It is
-an experimental extension, not a disclosed BDH-CQ component.
+and applies one final parameter-free LayerNorm after all `L` applications.
+Architecture v2 enables `normalize_each_depth`, changing the identity path to
 
-### 4.6 Architecture-v2 depth-local neuron state
+```text
+X_(l+1) = LayerNorm(X_l + Y_l)
+```
 
-The production-v2 experiment optionally retains the complete positive
-`[B,H,N,Q]` lift between applications of the shared block. A token/head scalar
-`u = sigmoid(W_u X + raw_u)` forms
-`S_l = (1-u)S_(l-1) + uZ_l`; `W_u` starts at zero and `raw_u` starts at
-`logit(0.2)`. The next depth can inject an RMS-normalized copy into its Q/K
-gate, with the injection strength initialized to zero. This state resets at
-every outer `forward`; it is not serialized inside [`Memory`](../src/model.rs),
-does not cross token chunks, and does not replace CQ. See
-[`v2-training.md`](v2-training.md) for the pilots.
+and likewise applies parameter-free LayerNorm to the Attention Residual / MHAR
+readout before it becomes the next depth's narrow state. The optional
+Attention Residual replaces identity addition with a learned mixture of the
+seed plus true block deltas `[X_0, Y_0, Y_1, ...]`. Multi-Head Attention
+Residual divides `D` into contiguous feature subspaces and gives each one an
+independent softmax distribution over saved depths. Full-width RMSNorm is
+applied before the split, the learned query is zero-initialized, and H=1
+exactly recovers the older single-query router. LayerNorm after the readout
+does not change that zero-query uniform routing distribution. These mechanisms
+are experimental extensions, not disclosed BDH-CQ components.
+
+### 4.6 Architecture-v2 wide delta state
+
+V2 makes `[B,H,N,Q]` a genuine recurrent computational state while retaining
+`D` as the communication channel between depths. With `S_prev` absent, the
+first candidate is accepted whole—there is no artificial 80% retention of
+zero:
+
+```text
+G_l = ReLU(W_qk X_l + alpha ⊙ RMSNorm(S_prev))
+Z_l = BDH_neuron_update(G_l, X_l, CQ_l)
+
+if S_prev is None:
+    DeltaS_l = Z_l
+    S_l = Z_l
+else:
+    u_(b,h,n,q) = sigmoid(W_u(X_l)_(b,n,h) + raw_u_(h,q))
+    DeltaS_l = u_l ⊙ (Z_l - S_prev)
+    S_l = S_prev + DeltaS_l
+
+Y_l = LayerNorm(W_out concat(DeltaS_l))
+X_(l+1) = LayerNorm(X_l + Y_l)             # v2 identity residual
+```
+
+`raw_u` is `[H,Q]`, while the cheap input-dependent projection remains only
+`D -> H` and broadcasts over `Q`. Thus neuron coordinates in one head may
+learn different baseline timescales without a `D -> H*Q` gate matrix.
+Injection is also per-neuron:
+`alpha = tanh(raw_alpha)`, `raw_alpha: [H,Q]`. Production v2 initializes
+`alpha=0.05`: non-zero enough for a live direct path, yet small relative to
+`W_qk X`. There is deliberately no `(H*Q)^2` transition.
+
+The distinction between `S_l` and `DeltaS_l` is essential. `S_l` is the full
+wide state used at the next recurrent application. Only `DeltaS_l` enters
+`proj_out`, so additive residuals and MHAR never re-project and re-add all old
+wide information. MHAR history therefore remains `[X0, Y0, Y1, ...]`, with
+each `Y_l` representing new information from that application.
+
+For ordinary token calls the wide state starts empty and is discarded after
+the shared block has run `L` times; it never crosses token chunks. For
+`Stage::Think(R)`, where `N=1`, [`LatentWorkspace`](../src/model.rs) carries
+`[B,H,1,Q]` from reasoning iteration `r` to `r+1` with gradients intact. A new
+`Think` chain starts with an empty workspace, and the workspace is never
+stored in `Memory.fast_weights`.
 
 ## 5. Contextual memory versus latent workspace
 
@@ -213,14 +257,17 @@ The distinction is central:
 
 | State | Rust representation | Shape | Purpose |
 |---|---|---|---|
-| contextual state `S` | `Memory.fast_weights` | `L × [B,H,Q,D]` | compressed facts/associations from ingested context |
+| contextual CQ state `M` | `Memory.fast_weights` | `L × [B,H,Q,D]` | compressed facts/associations from ingested context |
 | latest hidden sequence | `Memory.embeds` | `[B,N,D]` | output of the latest pass |
 | latent workspace `H` | last position sliced from `Memory.embeds` | `[B,1,D]` | continuously transformed reasoning state |
+| latent-only wide workspace `S` | `LatentWorkspace` | `[B,H,1,Q]` | full neuron state inside one `Think(R)` chain |
 
 `Stage::Think(R)` does not sample hidden tokens. It slices the last hidden
 position, feeds it back as a continuous embedding, and runs the model `R`
-times. If latent memory writes are enabled, thinking also modifies `S`; if
-disabled, each iteration can still read `S`, while all `M_l` remain frozen.
+times while carrying its separate wide workspace. If latent memory writes are
+enabled, thinking also modifies contextual `M`; if disabled, each iteration
+can still read `M`, while all CQ matrices remain frozen. The wide workspace is
+independent of that write policy.
 
 `Memory.position_offsets` contains one RoPE cursor per batch row. It advances
 for both real tokens and thought positions, resets independently at document

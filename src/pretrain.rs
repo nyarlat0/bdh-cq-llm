@@ -115,6 +115,12 @@ pub struct ModelConfig {
     /// Initial fraction of newly computed full neuron state.
     #[serde(default = "default_gated_neuron_state_initial_update")]
     pub gated_neuron_state_initial_update: f64,
+    /// Initial bounded per-neuron state-injection strength.
+    #[serde(default)]
+    pub gated_neuron_state_initial_injection: f64,
+    /// Apply parameter-free LayerNorm after every recurrent depth.
+    #[serde(default)]
+    pub normalize_each_depth: bool,
     /// Apply learned exponential retention to CQ fast weights.
     #[serde(default)]
     pub cq_memory_decay: bool,
@@ -343,6 +349,11 @@ impl PretrainConfig {
             && self.model.gated_neuron_state_initial_update < 1.0)
         {
             return Err("model.gated_neuron_state_initial_update must be in (0, 1)".into());
+        }
+        if !(-1.0 < self.model.gated_neuron_state_initial_injection
+            && self.model.gated_neuron_state_initial_injection < 1.0)
+        {
+            return Err("model.gated_neuron_state_initial_injection must be in (-1, 1)".into());
         }
         if !(0.0 < self.model.cq_memory_initial_rho && self.model.cq_memory_initial_rho < 1.0) {
             return Err("model.cq_memory_initial_rho must be in (0, 1)".into());
@@ -803,6 +814,8 @@ mod tests {
         assert_eq!(config.model.attn_residual_heads, 8);
         assert!(config.model.gated_neuron_state);
         assert_eq!(config.model.gated_neuron_state_initial_update, 0.2);
+        assert_eq!(config.model.gated_neuron_state_initial_injection, 0.05);
+        assert!(config.model.normalize_each_depth);
         assert!(config.model.cq_memory_decay);
         assert_eq!(config.memory.chunks_per_detach, 1);
 
@@ -841,6 +854,8 @@ mod tests {
             assert_eq!(config.model.attn_residual, attention_residual);
             assert_eq!(config.model.gated_neuron_state, neuron_state);
             assert_eq!(config.model.attn_residual_heads, routing_heads);
+            assert_eq!(config.model.gated_neuron_state_initial_injection, 0.05);
+            assert!(config.model.normalize_each_depth);
             assert_eq!(config.model.dim_qk_heads, 6_144);
             assert_eq!(
                 config.optimizer.micro_batch_size as u64
@@ -848,6 +863,20 @@ mod tests {
                     * config.sequence_length as u64,
                 16_384
             );
+        }
+    }
+
+    #[test]
+    fn rope_sweep_changes_only_rotary_width_and_run_directory() {
+        let baseline = PretrainConfig::from_path("configs/rx6700-v2-rope-64.json").unwrap();
+        assert_eq!(baseline.model.rotary_dim, 64);
+        for width in [64, 192, 384] {
+            let mut config =
+                PretrainConfig::from_path(format!("configs/rx6700-v2-rope-{width}.json")).unwrap();
+            assert_eq!(config.model.rotary_dim, width);
+            config.model.rotary_dim = baseline.model.rotary_dim;
+            config.run_dir = baseline.run_dir.clone();
+            assert_eq!(config, baseline);
         }
     }
 }

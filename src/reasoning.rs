@@ -3,10 +3,12 @@
 //! The wrapper is where the paper's two state variables become visibly
 //! different:
 //!
-//! - contextual state `S` is [`Memory::fast_weights`](crate::model::Memory),
+//! - contextual CQ state `M` is [`Memory::fast_weights`](crate::model::Memory),
 //!   accumulated while demonstrations and query tokens are ingested;
 //! - workspace `H` is the final position of [`Memory::embeds`](crate::model::Memory),
 //!   repeatedly transformed without decoding an intermediate token.
+//! - experimental v2 wide state `S` is a separate `[B,H,1,Q]` latent-only
+//!   workspace carried inside one `Think(R)` chain and never stored in `Memory`.
 //!
 //! A stage list such as `Tokens(prompt), Think(8), Tokens(answer)` therefore
 //! means “update context, run eight continuous recurrent passes, then
@@ -21,7 +23,7 @@ use rand::RngExt;
 
 use crate::{
     error::BdhError,
-    model::{Bdh, BdhForwardOptions, Memory, ModelInput},
+    model::{Bdh, BdhForwardOptions, LatentWorkspace, Memory, ModelInput},
 };
 
 /// One segment in an interleaved reasoning program.
@@ -228,13 +230,20 @@ impl<B: Backend> ReasoningWrapper<B> {
                     }
 
                     let update = stage_override.unwrap_or(options.update_latent_memory);
+                    // This workspace belongs to this Think chain only. It is
+                    // carried through all outer iterations with its autograd
+                    // graph intact, then dropped before the next token stage
+                    // (or a later independent Think stage). It never enters
+                    // Memory.fast_weights and therefore cannot pollute CQ.
+                    let mut wide_workspace = LatentWorkspace::new();
                     for _ in 0..*iterations {
                         if let Some(step_embedding) = &self.latent_step_embedding {
                             latent = latent + step_embedding.val().reshape([1, 1, self.bdh.dim()]);
                         }
-                        let output = self.bdh.forward(
-                            ModelInput::Embeddings(latent),
+                        let (output, next_workspace) = self.bdh.forward_latent(
+                            latent,
                             memory,
+                            wide_workspace,
                             BdhForwardOptions {
                                 update_memory: update,
                                 return_logits: false,
@@ -245,6 +254,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                                 document_starts: None,
                             },
                         )?;
+                        wide_workspace = next_workspace;
                         attention_history = output.attention_history;
                         memory = Some(output.memory);
                         latent = memory.as_ref().unwrap().embeds.clone();

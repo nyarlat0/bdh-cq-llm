@@ -2,7 +2,7 @@
   "format_version": 2,
   "tokenizer": "artifacts/tokenizer.json",
   "packed_dir": "datasets/packed/smoke-v1",
-  "run_dir": "/tmp/bdh-cq-v2-gpu-smoke-scaled",
+  "run_dir": "/tmp/bdh-cq-v2-delta-gpu-smoke",
   "seed": 42,
   "sequence_length": 32,
   "block_sequences": 16,
@@ -29,6 +29,8 @@
     "attn_residual_depth_bias_distance": 0,
     "gated_neuron_state": true,
     "gated_neuron_state_initial_update": 0.2,
+    "gated_neuron_state_initial_injection": 0.05,
+    "normalize_each_depth": true,
     "cq_memory_decay": true,
     "cq_memory_initial_rho": 0.995
   },

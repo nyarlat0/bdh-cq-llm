@@ -2,7 +2,7 @@
   "format_version": 2,
   "tokenizer": "artifacts/tokenizer-v2-24576.json",
   "packed_dir": "datasets/packed/rx6700-v2-24576",
-  "run_dir": "runs/rx6700-v2-delta-pilot-attnres-state",
+  "run_dir": "runs/rx6700-v2-rope-64",
   "seed": 42,
   "sequence_length": 256,
   "block_sequences": 256,

@@ -140,10 +140,11 @@ counts and replace the CPU backend for real experiments.
   supervision, and answer next-token supervision;
 - optional Multi-Head Attention Residual history (with H=1 compatibility) and
   its cycle-distance bias;
-- optional full positive neuron state carried across recurrent depth, with a
-  bounded input-dependent update gate;
-- optional learned per-head CQ decay, explicit RoPE width and tied token/LM
-  embeddings;
+- experimental full positive neuron delta-state carried across recurrent
+  depth (and inside one latent Think chain), with per-neuron base update and
+  bounded direct injection;
+- optional learned per-neuron CQ decay, parameter-free per-depth narrow
+  normalization, explicit RoPE width and tied token/LM embeddings;
 - greedy or top-k/temperature generation;
 - propagation, copying, ordering, and nesting task families;
 - the 14-token grid codec and the complete public ARC objective;

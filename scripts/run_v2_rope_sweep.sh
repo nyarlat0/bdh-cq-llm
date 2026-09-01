@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# Run four architecture pilots plus an H=1 AttnRes control on GPU 0.
+# Compare RoPE widths without changing any other architecture or budget knob.
 
 set -eu
 
 device="${1:-0}"
-# 1,220 is divisible by the four optimizer updates in a 256-sequence work
-# block, so graceful stopping does not overshoot one pilot's token budget.
 steps=1220
 
 if [ ! -f artifacts/tokenizer-v2-24576.json ]; then
@@ -22,16 +20,16 @@ done
 
 cargo build --release --bin train_llm
 
-for name in additive attnres state attnres-state attnres-state-h1; do
-    run_dir="runs/rx6700-v2-delta-pilot-$name"
+for width in 64 192 384; do
+    run_dir="runs/rx6700-v2-rope-$width"
     if [ -e "$run_dir" ]; then
-        echo "$run_dir already exists; refusing to resume and corrupt a fixed-budget comparison." >&2
+        echo "$run_dir already exists; refusing to resume a fixed-budget comparison." >&2
         exit 1
     fi
     ./target/release/train_llm \
-        --config "configs/rx6700-v2-pilot-$name.json" \
+        --config "configs/rx6700-v2-rope-$width.json" \
         --device "$device" \
         --max-steps "$steps"
 done
 
-python3 scripts/summarize_v2_pilots.py
+python3 scripts/summarize_v2_rope_sweep.py

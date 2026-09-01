@@ -56,7 +56,7 @@ def main() -> None:
         speeds = [event["tokens_per_second"] for event in events if event["event"] == "train"]
         losses = [event["loss"] for event in events if event["event"] == "train"]
         # Ignore the compilation/autotune-heavy first update. Keeping the
-        # production GA=16 and BPTT=8 is essential: a cheaper benchmark could
+        # production GA=16 and one-chunk TBPTT is essential: a cheaper benchmark could
         # fit even when the actual activation graph would OOM.
         rows.append((width, statistics.median(speeds[1:]), statistics.mean(losses[-2:])))
 

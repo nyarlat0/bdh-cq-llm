@@ -47,17 +47,20 @@ type AnyError = Box<dyn std::error::Error>;
 /// AdamW policy used by the v2 trainer.
 ///
 /// Matrices and embedding tables receive the configured decoupled decay.
-/// Rank-1 parameters (normalization scales, biases, `raw_u`, `raw_rho` and
-/// other gates) use the identical Adam moments without decay. In particular,
-/// this prevents parameter regularization from silently pulling sigmoid gate
-/// probabilities toward 0.5 regardless of the language-model gradient.
+/// Rank-1 parameters and the explicitly configured per-neuron `[H,Q]` gate
+/// matrices use identical Adam moments without decay. The shape exception is
+/// semantic to this architecture: `raw_u`, `raw_alpha`, and `raw_rho` all have
+/// exactly `[H,Q]`, while learned projections retain decay. This prevents
+/// regularization from silently pulling sigmoid/tanh gates toward their
+/// central values regardless of the language-model gradient.
 #[derive(Clone)]
-struct AdamWNoDecay1d {
+struct AdamWSelectiveDecay {
     decayed: AdamW,
     no_decay: AdamW,
+    per_neuron_gate_shape: [usize; 2],
 }
 
-impl<B: Backend> SimpleOptimizer<B> for AdamWNoDecay1d {
+impl<B: Backend> SimpleOptimizer<B> for AdamWSelectiveDecay {
     type State<const D: usize> = AdamWState<B, D>;
 
     fn step<const D: usize>(
@@ -67,7 +70,10 @@ impl<B: Backend> SimpleOptimizer<B> for AdamWNoDecay1d {
         gradient: Tensor<B, D>,
         state: Option<Self::State<D>>,
     ) -> (Tensor<B, D>, Option<Self::State<D>>) {
-        if D == 1 {
+        let shape = tensor.shape();
+        let is_per_neuron_gate =
+            D == 2 && shape.dims::<D>().as_slice() == self.per_neuron_gate_shape;
+        if D == 1 || is_per_neuron_gate {
             self.no_decay.step(learning_rate, tensor, gradient, state)
         } else {
             self.decayed.step(learning_rate, tensor, gradient, state)
@@ -146,6 +152,9 @@ struct LogEvent<'a> {
     base_u_min: Option<f32>,
     base_u_mean: Option<f32>,
     base_u_max: Option<f32>,
+    state_alpha_min: Option<f32>,
+    state_alpha_mean: Option<f32>,
+    state_alpha_max: Option<f32>,
     gpu_requested_mib: Option<u64>,
     gpu_vram_mib: Option<u64>,
     gpu_gtt_mib: Option<u64>,
@@ -219,7 +228,7 @@ struct ValidationAccumulator {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct ProbabilitySummary {
+struct ParameterSummary {
     minimum: Option<f32>,
     mean: Option<f32>,
     maximum: Option<f32>,
@@ -357,15 +366,22 @@ fn main() -> Result<(), AnyError> {
         .with_attn_residual_depth_bias_distance(config.model.attn_residual_depth_bias_distance)
         .with_gated_neuron_state(config.model.gated_neuron_state)
         .with_gated_neuron_state_initial_update(config.model.gated_neuron_state_initial_update)
+        .with_gated_neuron_state_initial_injection(
+            config.model.gated_neuron_state_initial_injection,
+        )
+        .with_normalize_each_depth(config.model.normalize_each_depth)
         .with_cq_memory_decay(config.model.cq_memory_decay)
         .with_cq_memory_initial_rho(config.model.cq_memory_initial_rho)
         .init::<TrainingBackend>(&device)?;
     println!("model parameters: {}", model.num_params());
     println!(
-        "architecture: MHAR heads={}, tied_depth_query={}, gated_full_u0={:.3}, cq_rho0={:.5}, TBPTT={}x{} tokens/lane",
+        "architecture: MHAR heads={}, tied_depth_query={}, delta_wide={}, u0={:.3}, alpha0={:.3}, depth_norm={}, cq_rho0={:.5}, TBPTT={}x{} tokens/lane",
         model.attention_residual_heads(),
         config.model.attn_residual_tied,
+        config.model.gated_neuron_state,
         config.model.gated_neuron_state_initial_update,
+        config.model.gated_neuron_state_initial_injection,
+        config.model.normalize_each_depth,
         config.model.cq_memory_initial_rho,
         config.memory.chunks_per_detach,
         config.sequence_length,
@@ -377,9 +393,13 @@ fn main() -> Result<(), AnyError> {
         .with_beta_1(config.optimizer.beta_1)
         .with_beta_2(config.optimizer.beta_2)
         .with_weight_decay(config.optimizer.weight_decay);
-    let mut optimizer = OptimizerAdaptor::from(AdamWNoDecay1d {
+    let mut optimizer = OptimizerAdaptor::from(AdamWSelectiveDecay {
         decayed: adam.clone().build(),
         no_decay: adam.with_weight_decay(0.0).build(),
+        per_neuron_gate_shape: [
+            config.model.heads,
+            config.model.dim_qk_heads / config.model.heads,
+        ],
     })
     .with_grad_clipping(GradientClippingConfig::Norm(config.optimizer.gradient_clip_norm).init());
 
@@ -674,8 +694,9 @@ where
         if state.optimizer_step.is_multiple_of(config.log_every_steps) {
             let interval_seconds = interval_start.elapsed().as_secs_f64().max(1e-6);
             let (memory_rms, memory_abs_max) = memory_statistics(memory.as_ref())?;
-            let rho = probability_statistics(model.cq_retention_probabilities())?;
-            let base_u = probability_statistics(model.base_state_update_probabilities())?;
+            let rho = tensor_statistics(model.cq_retention_probabilities())?;
+            let base_u = tensor_statistics(model.base_state_update_probabilities())?;
+            let state_alpha = tensor_statistics(model.state_injection_strengths())?;
             let gpu_memory = gpu_memory_usage();
             let gpu_peak = interval_gpu_peak;
             if !gtt_spill_warning_emitted && gpu_peak.gtt_mib.is_some_and(|mib| mib >= 1024) {
@@ -722,6 +743,9 @@ where
                 base_u_min: base_u.minimum,
                 base_u_mean: base_u.mean,
                 base_u_max: base_u.maximum,
+                state_alpha_min: state_alpha.minimum,
+                state_alpha_mean: state_alpha.mean,
+                state_alpha_max: state_alpha.maximum,
                 gpu_requested_mib: gpu_memory.and_then(|usage| usage.requested_mib),
                 gpu_vram_mib: gpu_memory.and_then(|usage| usage.vram_mib),
                 gpu_gtt_mib: gpu_memory.and_then(|usage| usage.gtt_mib),
@@ -1097,20 +1121,20 @@ fn gpu_memory_usage() -> Option<GpuMemoryUsage> {
     None
 }
 
-fn probability_statistics(
-    probabilities: Option<Tensor<TrainingBackend, 1>>,
-) -> Result<ProbabilitySummary, AnyError> {
+fn tensor_statistics<const D: usize>(
+    probabilities: Option<Tensor<TrainingBackend, D>>,
+) -> Result<ParameterSummary, AnyError> {
     let Some(probabilities) = probabilities else {
-        return Ok(ProbabilitySummary::default());
+        return Ok(ParameterSummary::default());
     };
     let values = probabilities.to_data().to_vec::<f32>()?;
     if values.is_empty() {
-        return Ok(ProbabilitySummary::default());
+        return Ok(ParameterSummary::default());
     }
     let minimum = values.iter().copied().fold(f32::INFINITY, f32::min);
     let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mean = values.iter().map(|value| f64::from(*value)).sum::<f64>() / values.len() as f64;
-    Ok(ProbabilitySummary {
+    Ok(ParameterSummary {
         minimum: Some(minimum),
         mean: Some(mean as f32),
         maximum: Some(maximum),
@@ -1835,24 +1859,33 @@ mod tests {
     }
 
     #[test]
-    fn adamw_exempts_rank_one_parameters_from_decay() {
+    fn adamw_exempts_rank_one_and_per_neuron_gate_parameters_from_decay() {
         type OptimBackend = NdArray<f32>;
         let device = Default::default();
         let config = AdamWConfig::new().with_weight_decay(0.1);
-        let optimizer = AdamWNoDecay1d {
+        let optimizer = AdamWSelectiveDecay {
             decayed: config.clone().build(),
             no_decay: config.with_weight_decay(0.0).build(),
+            per_neuron_gate_shape: [2, 3],
         };
         let rank_one = Tensor::<OptimBackend, 1>::ones([2], &device);
-        let rank_two = Tensor::<OptimBackend, 2>::ones([1, 2], &device);
+        let per_neuron_gate = Tensor::<OptimBackend, 2>::ones([2, 3], &device);
+        let ordinary_matrix = Tensor::<OptimBackend, 2>::ones([3, 2], &device);
         let (rank_one, _) = optimizer.step(0.1, rank_one, Tensor::zeros([2], &device), None);
-        let (rank_two, _) = optimizer.step(0.1, rank_two, Tensor::zeros([1, 2], &device), None);
+        let (per_neuron_gate, _) =
+            optimizer.step(0.1, per_neuron_gate, Tensor::zeros([2, 3], &device), None);
+        let (ordinary_matrix, _) =
+            optimizer.step(0.1, ordinary_matrix, Tensor::zeros([3, 2], &device), None);
         assert_eq!(
             rank_one.into_data().to_vec::<f32>().unwrap(),
             vec![1.0, 1.0]
         );
-        rank_two.into_data().assert_approx_eq::<f32>(
-            &TensorData::new(vec![0.99_f32, 0.99], [1, 2]),
+        assert_eq!(
+            per_neuron_gate.into_data().to_vec::<f32>().unwrap(),
+            vec![1.0; 6]
+        );
+        ordinary_matrix.into_data().assert_approx_eq::<f32>(
+            &TensorData::new(vec![0.99_f32; 6], [3, 2]),
             burn::tensor::Tolerance::absolute(1e-6),
         );
     }

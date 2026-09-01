@@ -31,6 +31,7 @@ code come from?” and “which parts are actually disclosed by the papers?”
 | low-rank communication | `proj_up`, `proj_out` | `D -> Q` per head, then `H*Q -> D` |
 | layerwise fixed state | `Memory.fast_weights` | one `[B,H,Q,D]` tensor for each recurrent depth |
 | shared parameters across depth | the single `BdhBlock` field | the same parameters are applied `depth` times |
+| experimental wide computational state | `BdhBlock`, `LatentWorkspace` | v2-only `[B,H,N,Q]` delta recurrence; not a disclosed Pathway update |
 
 The first four rows are system-level concepts published by the BDH-CQ paper.
 The exact formulas in the third column are choices made by the public
@@ -40,7 +41,7 @@ reconstruction; the paper explicitly does not disclose them.
 
 | Python source | Rust counterpart | Coverage |
 |---|---|---|
-| `bdh_cq/bdh_cq.py::BDHBlock` | `src/model.rs::BdhBlock` | Q/K/gate projection, partial RoPE, causal attention, fast-state read/write, low-rank projections |
+| `bdh_cq/bdh_cq.py::BDHBlock` | `src/model.rs::BdhBlock` | Q/K/gate projection, partial RoPE, causal attention, fast-state read/write, low-rank projections; delta wide state is a local v2 extension |
 | `bdh_cq/bdh_cq.py::BDH` | `src/model.rs::Bdh` | embedding, shared recurrent depth, per-depth memories, logits |
 | `AttentionResidual` and depth-bias helper | `MultiHeadAttentionResidual`, `compute_attn_residual_depth_bias` | optional history mixing; H=1 preserves the old router and H>1 adds feature-subspace routing |
 | `BDHReasoningWrapper.forward` | `ReasoningWrapper::forward` | token/embed/latent interleaving, write policies, losses |
@@ -65,8 +66,8 @@ examples rather than copied as an environment-specific training application.
 - Current-chunk attention is unnormalized and strictly causal; the diagonal is
   zero.
 - The same positive projection supplies Q, K, and the later gate.
-- RoPE applies to only half of each head's features.
-- Memory is additive, with no decay or normalization at write time.
+- Legacy RoPE applies to half of each head; explicit `rotary_dim` is optional.
+- Legacy memory is additive, with no decay or normalization at write time.
 - Thought steps can independently enable or freeze memory writes.
 - Latent steps are supervised against the first token of the next discrete
   segment.
@@ -116,8 +117,21 @@ This separation is why the crate and documentation consistently use phrases
 such as “public reconstruction” rather than claiming to reproduce Pathway's
 reported 150M-parameter system or benchmark results.
 
-Architecture v2 goes further than the pinned Python reconstruction: it adds
-learned sigmoid CQ decay, depth-local full neuron state, tied vocabulary
-weights, explicit narrow RoPE and Multi-Head Attention Residual routing. MHAR
-follows its own cited paper; it is not evidence about Pathway's undisclosed
-BDH-CQ internals.
+Architecture v2 goes further than the pinned Python reconstruction. Its wide
+state is a distinct recurrent `[B,H,N,Q]` object:
+
+```text
+DeltaS = Z                              when no previous S exists
+DeltaS = sigmoid(W_u X + raw_u) ⊙ (Z-S) otherwise
+S_next = S + DeltaS
+Y = LayerNorm(W_out DeltaS)
+```
+
+`raw_u`, bounded `raw_alpha` injection and sigmoid CQ retention `raw_rho` are
+all per-neuron `[H,Q]`; there is no `(H*Q)^2` state transition. V2 also adds
+parameter-free normalization after each recurrent level, tied vocabulary
+weights, explicit RoPE width and Multi-Head Attention Residual routing over
+true deltas. The one-position wide state may cross iterations inside one
+`Think(R)` call through `LatentWorkspace`, but never crosses ordinary token
+chunks or enters CQ. MHAR follows its separately cited paper; none of these v2
+choices is evidence about Pathway's undisclosed BDH-CQ internals.

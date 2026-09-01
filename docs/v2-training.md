@@ -26,8 +26,8 @@ is:
 |---|---:|
 | one tied `24576 × 512` vocabulary matrix | 12.58M |
 | shared `W_qk`, `W_up`, `W_out` at `H*Q=6144` | 9.44M |
-| state gates, multi-head Attention Residual and CQ decay | <0.01M |
-| total | about 22.03M |
+| state gates, multi-head Attention Residual and CQ decay | <0.03M |
+| total | 22,043,648 |
 
 The total model is smaller, but the recurrent body is four times wider than
 v1. This is a much better parameter allocation for a small base LM.
@@ -40,37 +40,53 @@ same block weights.
 
 ### 2.1 RoPE
 
-Only the first 64 coordinates in every 768-wide head receive RoPE. The old
-implicit rule rotated half of each head. An explicit narrow positional slice
-leaves most of the positive workspace semantic and avoids turning hundreds of
-ReLU coordinates into signed rotations. Local causal attention still covers
-the complete 256-token chunk.
+Production keeps the first 64 coordinates in every 768-wide head under RoPE
+until an isolated sweep provides evidence for changing it. This is a
+hypothesis, not an established optimum. The old implicit rule rotated half of
+each head. Local causal attention still covers the complete 256-token chunk.
+The separate 64/192/384 pilot changes no model dimension, training budget or
+other mechanism; see section 6.
 
 ### 2.2 Full neuron state across recurrent depth
 
 Let `Z_l` be the ordinary lifted/gated BDH activation with shape
-`[B,H,N,Q]`. V2 optionally carries another tensor of exactly that shape:
+`[B,H,N,Q]`. V2 carries a full state `S_l` of exactly that shape, but exports
+only its current change through the narrow communication channel:
 
 ```text
-u_l = sigmoid(W_u X_l + raw_u)              [B,H,N,1]
-S_l = (1 - u_l) S_(l-1) + u_l Z_l          [B,H,N,Q]
-Y_l = LayerNorm(W_out concat(S_l))          [B,N,D]
+G_l = ReLU(W_qk X_l + alpha ⊙ RMSNorm(S_(l-1)))
+
+if S_(l-1) is absent:
+    DeltaS_l = Z_l
+    S_l = Z_l
+else:
+    u_l = sigmoid(W_u X_l + raw_u)          [B,H,N,Q]
+    DeltaS_l = u_l ⊙ (Z_l - S_(l-1))       [B,H,N,Q]
+    S_l = S_(l-1) + DeltaS_l                [B,H,N,Q]
+
+Y_l = LayerNorm(W_out concat(DeltaS_l))      [B,N,D]
 ```
 
-Before constructing Q/K at the next depth, normalized `S_l` can also be added
-to the positive gate through one learned strength per head. Those strengths
-and `W_u` start at zero. `raw_u` is learned per BDH head and starts at
-`logit(0.2)`, so `u≈0.2`: a depth initially retains 80% of its preceding wide
-state and writes 20% of `Z_l`. At the first depth the absent previous state is
-zero, hence the wide output is initially `0.2 Z_0`; this is intentional and is
-covered by the architecture pilots rather than being hidden by an almost-open
-gate.
+`raw_u` is `[H,Q]`, while `W_u X` remains the cheap `[B,N,H]` projection and
+broadcasts over `Q`. Different coordinates in one head can therefore learn
+different baseline timescales for only `H*Q` extra parameters. `raw_u` starts
+at `logit(0.2)`. The first state is `Z_0`, not `0.2 Z_0`; the EMA/update begins
+only when an actual previous state exists.
 
-This state is deliberately local to one `Bdh::forward` call. It survives the
-eight recurrent depths of a chunk and receives gradients through them, then is
-discarded. Carrying `[B,H,N,Q]` between chunks would make state size depend on
-chunk length, retain token-aligned activations indefinitely and duplicate the
-job of CQ. Only the fixed-size CQ matrices cross chunk boundaries.
+Direct injection is also per-neuron:
+`alpha = tanh(raw_alpha)`, `raw_alpha: [H,Q]`. V2 configs initialize
+`alpha=0.05`, a small live path near the old no-injection behavior. No
+`[H*Q,H*Q]` matrix exists. Most importantly, `proj_out` consumes `DeltaS`, not
+`S_l`: accumulated wide information is not projected and residually re-added
+at every depth.
+
+For ordinary token chunks this state is local to one `Bdh::forward` call. It
+survives eight recurrent depths, then is discarded. Carrying `[B,H,N,Q]`
+between chunks would make state size depend on chunk length, retain
+token-aligned activations indefinitely and duplicate CQ. During
+`Stage::Think(R)`, however, `N=1`: an explicit `LatentWorkspace [B,H,1,Q]`
+survives all `R` outer reasoning iterations with gradients intact. It resets
+at the next independent Think chain and never enters `Memory.fast_weights`.
 
 ### 2.3 Multi-Head Attention Residual (MHAR)
 
@@ -81,10 +97,11 @@ state and all block deltas produced so far:
 history_l = [X_0, Y_0, ..., Y_l]                    [B,N,K,D]
 keys      = reshape(RMSNorm_D(history_l), K, R, D/R)
 a_(l,r)   = softmax_K(sum_d keys_(K,r,d) p_(r,d))
-X_(l+1)   = concat_r sum_K a_(l,r,K) history_(K,r)
+X_(l+1)   = LayerNorm(concat_r sum_K a_(l,r,K) history_(K,r))
 ```
 
-The production candidate uses `R=8` routing heads, so each independently
+Every `Y_l` in history is `W_out(DeltaS_l)`, never a projection of cumulative
+`S_l`. The production candidate uses `R=8` routing heads, so each independently
 chooses a depth mixture for a contiguous 64-feature subspace of `D=512`.
 RMSNorm is applied over the complete `D` row before splitting it; the softmax
 is over history depth separately for every routing head. There is no
@@ -105,21 +122,34 @@ Each recurrent depth still owns one fixed fast-weight matrix
 `M_l: [B,H,Q,D]`. Its update is now:
 
 ```text
-rho_h = sigmoid(raw_rho_h)
-M_l <- rho_h M_l + K_l^T V_l
+rho_(h,q) = sigmoid(raw_rho_(h,q))
+M_l <- rho ⊙ M_l + K_l^T V_l
 ```
 
-`raw_rho_h` is an unconstrained learned scalar per CQ head, and its sigmoid
-starts at 0.995. If it remained at that value, its half-life would be about 138
-chunks or 35.4K source tokens.
+`raw_rho` is an unconstrained `[H,Q]` tensor, and every sigmoid starts at
+0.995. If a coordinate remained at that value, its half-life would be about
+138 chunks or 35.4K source tokens.
 Decay prevents the unbounded magnitude growth of a purely additive sum while
-allowing training to learn longer or shorter retention. All rank-1 parameters
-(including `raw_rho`, `raw_u`, biases and normalization scales) are excluded
-from AdamW decay; matrices and embedding tables retain the configured decay.
-This prevents regularization alone from pulling sigmoid probabilities toward
-0.5. Logs report CQ RMS/maximum plus min/mean/max `rho` and base `u`.
+allowing individual neuron coordinates to learn longer or shorter retention.
+All rank-1 parameters plus the semantic `[H,Q]` arrays `raw_rho`, `raw_u` and
+`raw_alpha` are excluded from AdamW decay; projection matrices and embedding
+tables retain the configured decay. Logs report CQ RMS/maximum plus
+min/mean/max `rho`, base `u`, and bounded `alpha` rather than thousands of
+values.
 
-### 2.5 Tied vocabulary matrix
+### 2.5 Narrow recurrent normalization
+
+V2 applies parameter-free LayerNorm after every shared-block application:
+
+```text
+X_(l+1) = LayerNorm(X_l + Y_l)              additive path
+X_(l+1) = LayerNorm(MHAR([X_0,Y_0,...]))    routing path
+```
+
+The legacy/public-reconstruction default remains `normalize_each_depth=false`
+and applies only the final LayerNorm. No affine parameters are introduced.
+
+### 2.6 Tied vocabulary matrix
 
 The output logits are `hidden @ embedding^T / sqrt(D)`; the scale keeps random
 initial logits variance-bounded after hidden LayerNorm. There is no second
@@ -223,7 +253,7 @@ never silently overwritten. Complete shards are validated and reused, so an
 interrupted packing run can be resumed by executing the same command. The
 generated manifest records `ficbook_metadata_included: false`.
 
-## 6. Hardware width check, 2×2 pilots and H=1 control
+## 6. Hardware width check, architecture pilots and isolated RoPE sweep
 
 First compare `H*Q` 4096, 5120 and 6144 on one complete stateful work block:
 
@@ -249,10 +279,10 @@ for classic single-query routing. They have isolated run directories and the
 launcher refuses to resume an old pilot, because unequal token budgets
 invalidate the comparison.
 
-Corrected pilots use fresh `runs/rx6700-v2-pilot-tbptt1-*` directories. The
+Delta-state pilots use fresh `runs/rx6700-v2-delta-pilot-*` directories. The
 older pilot directories are deliberately preserved but must not be compared:
-their eight-chunk graphs spilled into GTT and ran under different hardware
-conditions.
+they used both the previous cumulative-state semantics and, for the oldest
+runs, eight-chunk graphs that spilled into GTT.
 
 The final report uses stateful held-out loss, per-source BPB, finite-state
 checks and median throughput. A difference below roughly 1% is weak evidence;
@@ -260,6 +290,20 @@ prefer the faster/simpler variant in that case. First select the winning
 `attn_residual`/`gated_neuron_state` combination, then require H=8 to beat its
 H=1 control before retaining eight routing heads. Copy those settings into the
 production config before its run directory exists.
+
+After selecting the combined architecture, compare positional width alone:
+
+```console
+scripts/run_v2_rope_sweep.sh 0
+```
+
+The three configs `rx6700-v2-rope-{64,192,384}.json` are identical except for
+`model.rotary_dim` and isolated `run_dir`. Each uses the same 1,220-update
+(19,988,480-token) budget and accelerated 5M-token CQ activation as the main
+pilots. Do not pool these runs into the A–E architecture table: the first table
+selects state/routing mechanisms, while this second experiment selects only
+RoPE width. Production intentionally remains at 64 until this comparison is
+complete.
 
 ## 7. Production and monitoring
 

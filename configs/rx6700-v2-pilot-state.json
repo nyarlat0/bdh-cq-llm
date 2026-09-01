@@ -2,7 +2,7 @@
   "format_version": 2,
   "tokenizer": "artifacts/tokenizer-v2-24576.json",
   "packed_dir": "datasets/packed/rx6700-v2-24576",
-  "run_dir": "runs/rx6700-v2-pilot-tbptt1-state",
+  "run_dir": "runs/rx6700-v2-delta-pilot-state",
   "seed": 42,
   "sequence_length": 256,
   "block_sequences": 256,
@@ -29,6 +29,8 @@
     "attn_residual_depth_bias_distance": 0,
     "gated_neuron_state": true,
     "gated_neuron_state_initial_update": 0.2,
+    "gated_neuron_state_initial_injection": 0.05,
+    "normalize_each_depth": true,
     "cq_memory_decay": true,
     "cq_memory_initial_rho": 0.995
   },

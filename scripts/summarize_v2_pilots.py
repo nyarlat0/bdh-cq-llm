@@ -26,7 +26,7 @@ def fmt(value: float | None, digits: int = 4) -> str:
 def main() -> None:
     rows: list[dict] = []
     for name in PILOTS:
-        events = load_events(Path(f"runs/rx6700-v2-pilot-tbptt1-{name}/train.jsonl"))
+        events = load_events(Path(f"runs/rx6700-v2-delta-pilot-{name}/train.jsonl"))
         train = [event for event in events if event.get("event") == "train"]
         validation = [event for event in events if event.get("event") == "validation"]
         finite = bool(train and validation) and all(

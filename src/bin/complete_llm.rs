@@ -133,6 +133,10 @@ fn main() -> Result<(), AnyError> {
         .with_attn_residual_depth_bias_distance(config.model.attn_residual_depth_bias_distance)
         .with_gated_neuron_state(config.model.gated_neuron_state)
         .with_gated_neuron_state_initial_update(config.model.gated_neuron_state_initial_update)
+        .with_gated_neuron_state_initial_injection(
+            config.model.gated_neuron_state_initial_injection,
+        )
+        .with_normalize_each_depth(config.model.normalize_each_depth)
         .with_cq_memory_decay(config.model.cq_memory_decay)
         .with_cq_memory_initial_rho(config.model.cq_memory_initial_rho)
         .init::<TrainingBackend>(&device)?;

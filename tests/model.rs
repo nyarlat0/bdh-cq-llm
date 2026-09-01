@@ -1,15 +1,35 @@
 use bdh_cq_llm::{
-    BdhConfig, BdhForwardOptions, ModelInput, MultiHeadAttentionResidual, ReasoningForwardOptions,
-    ReasoningWrapperConfig, Stage, compute_attn_residual_depth_bias,
+    BdhConfig, BdhForwardOptions, LatentWorkspace, ModelInput, MultiHeadAttentionResidual,
+    ReasoningForwardOptions, ReasoningWrapperConfig, Stage, compute_attn_residual_depth_bias,
 };
 use burn::{
     backend::{Autodiff, NdArray},
-    module::Module,
+    module::{Module, ModuleVisitor, Param},
+    optim::GradientsParams,
     tensor::{Int, Tensor, TensorData, Tolerance, backend::Backend},
 };
 
 type TestBackend = NdArray<f32>;
 type TrainBackend = Autodiff<TestBackend>;
+
+struct FiniteGradientVisitor<'a> {
+    gradients: &'a GradientsParams,
+    checked: usize,
+}
+
+impl ModuleVisitor<TrainBackend> for FiniteGradientVisitor<'_> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<TrainBackend, D>>) {
+        if let Some(gradient) = self.gradients.get::<TestBackend, D>(param.id) {
+            let values = gradient.into_data().to_vec::<f32>().unwrap();
+            assert!(
+                values.iter().all(|value| value.is_finite()),
+                "parameter {:?} has a non-finite gradient",
+                param.id
+            );
+            self.checked += 1;
+        }
+    }
+}
 
 fn tiny_config() -> BdhConfig {
     BdhConfig::new(16, 32)
@@ -29,6 +49,9 @@ fn ids<B: Backend>(batch: usize, sequence: usize, device: &B::Device) -> Tensor<
 fn core_model_has_fixed_size_per_depth_memory() {
     let device = Default::default();
     let model = tiny_config().init::<TestBackend>(&device).unwrap();
+    assert!(!model.normalizes_each_depth());
+    assert!(model.base_state_update_probabilities().is_none());
+    assert!(model.state_injection_strengths().is_none());
     let first = model
         .forward(
             ModelInput::TokenIds(ids(2, 7, &device)),
@@ -297,31 +320,53 @@ fn mhar_h1_and_h2_match_at_uniform_zero_query_initialization() {
 }
 
 #[test]
+fn zero_query_mhar_uniform_invariant_survives_per_depth_normalization() {
+    let device = Default::default();
+    let h1 = MultiHeadAttentionResidual::<TestBackend>::new(32, 1, 1, 0, &device);
+    let h2 = MultiHeadAttentionResidual::<TestBackend>::new(32, 1, 2, 0, &device);
+    let first = Tensor::<TestBackend, 3>::from_data(
+        TensorData::new(
+            (0..64).map(|value| value as f32 / 13.0).collect(),
+            [1, 2, 32],
+        ),
+        &device,
+    );
+    let sources = vec![first.clone(), first * -0.3 + 2.0];
+    let normalize = |input: Tensor<TestBackend, 3>| {
+        let centered = input.clone() - input.mean_dim(2);
+        let variance = centered.clone().square().mean_dim(2);
+        centered / (variance + 1e-5).sqrt()
+    };
+    let h1 = normalize(h1.forward([1, 2, 32], &sources, 0, 2, 1).unwrap());
+    let h2 = normalize(h2.forward([1, 2, 32], &sources, 0, 2, 1).unwrap());
+    h1.into_data()
+        .assert_approx_eq::<f32>(&h2.into_data(), Tolerance::absolute(1e-5));
+}
+
+#[test]
 fn learned_probability_parameters_start_at_requested_values() {
     let device = Default::default();
     let model = tiny_config()
         .with_gated_neuron_state(true)
         .with_gated_neuron_state_initial_update(0.2)
+        .with_gated_neuron_state_initial_injection(0.05)
         .with_cq_memory_decay(true)
         .with_cq_memory_initial_rho(0.995)
         .init::<TestBackend>(&device)
         .unwrap();
-    for value in model
-        .base_state_update_probabilities()
-        .unwrap()
-        .to_data()
-        .to_vec::<f32>()
-        .unwrap()
-    {
+    let base_update = model.base_state_update_probabilities().unwrap();
+    assert_eq!(base_update.dims(), [2, 64]);
+    for value in base_update.to_data().to_vec::<f32>().unwrap() {
         assert!((value - 0.2).abs() < 1e-6);
     }
-    for value in model
-        .cq_retention_probabilities()
-        .unwrap()
-        .to_data()
-        .to_vec::<f32>()
-        .unwrap()
-    {
+    let injection = model.state_injection_strengths().unwrap();
+    assert_eq!(injection.dims(), [2, 64]);
+    for value in injection.to_data().to_vec::<f32>().unwrap() {
+        assert!((value - 0.05).abs() < 1e-6);
+    }
+    let retention = model.cq_retention_probabilities().unwrap();
+    assert_eq!(retention.dims(), [2, 64]);
+    for value in retention.to_data().to_vec::<f32>().unwrap() {
         assert!((value - 0.995).abs() < 1e-6);
     }
 }
@@ -391,6 +436,8 @@ fn in_chunk_document_boundaries_match_independent_documents() {
         .with_attn_residual_heads(2)
         .with_gated_neuron_state(true)
         .with_gated_neuron_state_initial_update(0.2)
+        .with_gated_neuron_state_initial_injection(0.05)
+        .with_normalize_each_depth(true)
         .with_cq_memory_decay(true)
         .with_cq_memory_initial_rho(0.995)
         .init::<TestBackend>(&device)
@@ -473,6 +520,8 @@ fn batched_tbptt_matches_independent_lanes_with_different_boundaries() {
         .with_attn_residual(true)
         .with_attn_residual_heads(2)
         .with_gated_neuron_state(true)
+        .with_gated_neuron_state_initial_injection(0.05)
+        .with_normalize_each_depth(true)
         .with_cq_memory_decay(true)
         .init::<TestBackend>(&device)
         .unwrap();
@@ -590,6 +639,70 @@ fn depth_bias_matches_upstream_indexing_examples() {
 }
 
 #[test]
+fn latent_iterations_carry_wide_workspace_until_the_chain_resets() {
+    let device = Default::default();
+    TestBackend::seed(&device, 8_080);
+    let model = tiny_config()
+        .with_gated_neuron_state(true)
+        .with_gated_neuron_state_initial_update(0.2)
+        .with_gated_neuron_state_initial_injection(0.05)
+        .with_normalize_each_depth(true)
+        .init::<TestBackend>(&device)
+        .unwrap();
+    let memory = model
+        .forward(
+            ModelInput::TokenIds(ids(1, 5, &device)),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+        .memory;
+    let [_, sequence, dim] = memory.embeds.dims();
+    let latent = memory
+        .embeds
+        .clone()
+        .slice([0..1, sequence - 1..sequence, 0..dim]);
+    let frozen = BdhForwardOptions {
+        update_memory: false,
+        return_logits: false,
+        ..Default::default()
+    };
+    let (first, workspace) = model
+        .forward_latent(latent, Some(memory), LatentWorkspace::new(), frozen.clone())
+        .unwrap();
+    assert!(workspace.has_neuron_state());
+    assert_eq!(workspace.neuron_state_dims(), Some([1, 2, 1, 64]));
+
+    let second_latent = first.memory.embeds.clone();
+    let second_memory = first.memory;
+    let (carried, _) = model
+        .forward_latent(
+            second_latent.clone(),
+            Some(second_memory.clone()),
+            workspace,
+            frozen.clone(),
+        )
+        .unwrap();
+    let (reset, _) = model
+        .forward_latent(
+            second_latent,
+            Some(second_memory),
+            LatentWorkspace::new(),
+            frozen,
+        )
+        .unwrap();
+    let carried = carried.memory.embeds.into_data().to_vec::<f32>().unwrap();
+    let reset = reset.memory.embeds.into_data().to_vec::<f32>().unwrap();
+    assert!(
+        carried
+            .iter()
+            .zip(reset)
+            .any(|(with_state, without_state)| (*with_state - without_state).abs() > 1e-5),
+        "carrying the latent wide workspace had no observable effect"
+    );
+}
+
+#[test]
 fn architecture_v2_features_compose_and_backpropagate() {
     let device = Default::default();
     let model = BdhConfig::new(24, 32)
@@ -603,6 +716,8 @@ fn architecture_v2_features_compose_and_backpropagate() {
         .with_attn_residual_heads(2)
         .with_gated_neuron_state(true)
         .with_gated_neuron_state_initial_update(0.2)
+        .with_gated_neuron_state_initial_injection(0.05)
+        .with_normalize_each_depth(true)
         .with_cq_memory_decay(true)
         .with_cq_memory_initial_rho(0.99)
         .init::<TrainBackend>(&device)
@@ -611,10 +726,21 @@ fn architecture_v2_features_compose_and_backpropagate() {
     assert_eq!(model.rotary_features_per_head(), 16);
     assert!(model.has_tied_embeddings());
     assert!(model.has_cq_memory_decay());
-    let output = model
+    assert!(model.normalizes_each_depth());
+    let first = model
         .forward(
             ModelInput::TokenIds(ids(2, 6, &device)),
             None,
+            BdhForwardOptions {
+                collect_per_pass_hiddens: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let output = model
+        .forward(
+            ModelInput::TokenIds(ids(2, 6, &device)),
+            Some(first.memory),
             BdhForwardOptions {
                 collect_per_pass_hiddens: true,
                 ..Default::default()
@@ -632,7 +758,13 @@ fn architecture_v2_features_compose_and_backpropagate() {
     );
     let loss = output.logits.unwrap().powf_scalar(2.0).mean();
     assert!(loss.to_data().to_vec::<f32>().unwrap()[0].is_finite());
-    let _gradients = loss.backward();
+    let gradients = GradientsParams::from_grads(loss.backward(), &model);
+    let mut visitor = FiniteGradientVisitor {
+        gradients: &gradients,
+        checked: 0,
+    };
+    model.visit(&mut visitor);
+    assert!(visitor.checked > 0);
 }
 
 #[test]
@@ -677,4 +809,35 @@ fn tied_logits_have_variance_preserving_initial_scale() {
         .to_vec::<f32>()
         .unwrap()[0];
     assert!(maximum < 10.0, "initial tied logit magnitude {maximum}");
+}
+
+#[test]
+fn production_v2_parameter_growth_is_only_per_neuron_linear_storage() {
+    let device = Default::default();
+    let common = BdhConfig::new(24_576, 512)
+        .with_depth(8)
+        .with_heads(8)
+        .with_dim_qk_heads(6_144)
+        .with_rotary_dim(64)
+        .with_tie_embeddings(true)
+        .with_attn_residual(true)
+        .with_attn_residual_tied(true)
+        .with_attn_residual_heads(8)
+        .with_normalize_each_depth(true);
+    let baseline = common.clone().init::<TestBackend>(&device).unwrap();
+    let production = common
+        .with_gated_neuron_state(true)
+        .with_gated_neuron_state_initial_update(0.2)
+        .with_gated_neuron_state_initial_injection(0.05)
+        .with_cq_memory_decay(true)
+        .with_cq_memory_initial_rho(0.995)
+        .init::<TestBackend>(&device)
+        .unwrap();
+
+    assert_eq!(production.num_params(), 22_043_648);
+    assert_eq!(
+        production.num_params() - baseline.num_params(),
+        512 * 8 + 3 * 6_144,
+        "v2 state parameters must be D*H plus three H*Q arrays, never (H*Q)^2"
+    );
 }
