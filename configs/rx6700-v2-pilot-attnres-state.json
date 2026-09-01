@@ -2,7 +2,7 @@
   "format_version": 2,
   "tokenizer": "artifacts/tokenizer-v2-24576.json",
   "packed_dir": "datasets/packed/rx6700-v2-24576",
-  "run_dir": "runs/rx6700-v2-pilot-attnres-state",
+  "run_dir": "runs/rx6700-v2-pilot-tbptt1-attnres-state",
   "seed": 42,
   "sequence_length": 256,
   "block_sequences": 256,
@@ -25,10 +25,12 @@
     "tie_embeddings": true,
     "attn_residual": true,
     "attn_residual_tied": true,
+    "attn_residual_heads": 8,
     "attn_residual_depth_bias_distance": 0,
     "gated_neuron_state": true,
+    "gated_neuron_state_initial_update": 0.2,
     "cq_memory_decay": true,
-    "cq_memory_retention": 0.995
+    "cq_memory_initial_rho": 0.995
   },
   "optimizer": {
     "micro_batch_size": 4,
@@ -46,7 +48,7 @@
   },
   "memory": {
     "stateful_after_tokens": 5000000,
-    "chunks_per_detach": 8,
+    "chunks_per_detach": 1,
     "reset_on_document": true,
     "reset_on_work_block": true
   },

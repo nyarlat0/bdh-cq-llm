@@ -14,6 +14,10 @@ code come from?” and “which parts are actually disclosed by the papers?”
   arXiv:2509.26507.
 - Original reference implementation:
   [`pathwaycom/bdh`](https://github.com/pathwaycom/bdh).
+- Multi-Head Attention Residuals paper:
+  [*Multi-Head Attention Residuals*](https://arxiv.org/abs/2607.27230),
+  arXiv:2607.27230, plus its
+  [reference implementation](https://github.com/wdlctc/multi-head-attention-residuals).
 
 ## Paper equations to Rust concepts
 
@@ -38,7 +42,7 @@ reconstruction; the paper explicitly does not disclose them.
 |---|---|---|
 | `bdh_cq/bdh_cq.py::BDHBlock` | `src/model.rs::BdhBlock` | Q/K/gate projection, partial RoPE, causal attention, fast-state read/write, low-rank projections |
 | `bdh_cq/bdh_cq.py::BDH` | `src/model.rs::Bdh` | embedding, shared recurrent depth, per-depth memories, logits |
-| `AttentionResidual` and depth-bias helper | `AttentionResidual`, `compute_attn_residual_depth_bias` | optional history mixing and upstream indexing rule |
+| `AttentionResidual` and depth-bias helper | `MultiHeadAttentionResidual`, `compute_attn_residual_depth_bias` | optional history mixing; H=1 preserves the old router and H>1 adds feature-subspace routing |
 | `BDHReasoningWrapper.forward` | `ReasoningWrapper::forward` | token/embed/latent interleaving, write policies, losses |
 | `BDHReasoningWrapper.generate` | `ReasoningWrapper::generate` | greedy or top-k temperature sampling and raw-embedding feedback |
 | `bdh_cq/tasks.py` | `src/tasks.rs` | all four task families, level control, persistent parameters |
@@ -84,6 +88,9 @@ examples rather than copied as an environment-specific training application.
   `BdhError` instead of relying on assertions.
 - Attention-history vectors are passed and returned by ownership, instead of
   mutating a caller-owned Python list.
+- Stateful language-model batches carry one RoPE offset per row and accept
+  per-token document-start flags, so independently resetting lanes remain one
+  physical GPU forward.
 - Generated token sampling transfers a tiny logit vector to the CPU. This is
   portable across Burn backends, but not optimized for high-throughput
   serving.
@@ -108,3 +115,9 @@ implementation.
 This separation is why the crate and documentation consistently use phrases
 such as “public reconstruction” rather than claiming to reproduce Pathway's
 reported 150M-parameter system or benchmark results.
+
+Architecture v2 goes further than the pinned Python reconstruction: it adds
+learned sigmoid CQ decay, depth-local full neuron state, tied vocabulary
+weights, explicit narrow RoPE and Multi-Head Attention Residual routing. MHAR
+follows its own cited paper; it is not evidence about Pathway's undisclosed
+BDH-CQ internals.

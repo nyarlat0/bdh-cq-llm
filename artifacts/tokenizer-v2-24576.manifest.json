@@ -1,0 +1,56 @@
+{
+  "format_version": 1,
+  "tokenizer_file": "artifacts/tokenizer-v2-24576.json",
+  "algorithm": "byte-level BPE (GPT-2 regex pre-tokenization)",
+  "vocabulary_size_requested": 24576,
+  "vocabulary_size_actual": 24576,
+  "min_frequency": 2,
+  "max_token_length": 64,
+  "normalization": "none; input UTF-8 is preserved byte-for-byte",
+  "unknown_token": null,
+  "seed": 42,
+  "tokenizer_sample_budget_utf8_bytes": 1000000000,
+  "source_plan": [
+    {
+      "name": "fineweb2_hq",
+      "target_pretraining_tokens": 650000000,
+      "tokenizer_sample_budget_utf8_bytes": 650000000,
+      "sampled_sequences": 83005,
+      "sampled_utf8_bytes": 650000001
+    },
+    {
+      "name": "ficbook",
+      "target_pretraining_tokens": 300000000,
+      "tokenizer_sample_budget_utf8_bytes": 300000000,
+      "sampled_sequences": 20763,
+      "sampled_utf8_bytes": 300000000
+    },
+    {
+      "name": "ru_classic",
+      "target_pretraining_tokens": 50000000,
+      "tokenizer_sample_budget_utf8_bytes": 50000000,
+      "sampled_sequences": 58,
+      "sampled_utf8_bytes": 50000000
+    }
+  ],
+  "data_locations": {
+    "fineweb_dataset": "epfml/FineWeb2-HQ",
+    "fineweb_config": "rus_Cyrl",
+    "fineweb_revision": "c0c06e94fd3a44ae9e802b2b0fc533817601eb5e",
+    "ficbook_glob": "datasets/ficbook/*.parquet",
+    "ficbook_part_field": "clean_text",
+    "ficbook_metadata_included": false,
+    "classic_file": "datasets/ru-classic.txt"
+  },
+  "special_token_ids": {
+    "<|assistant|>": 6,
+    "<|bos|>": 1,
+    "<|doc|>": 3,
+    "<|eos|>": 2,
+    "<|eot|>": 7,
+    "<|pad|>": 0,
+    "<|system|>": 4,
+    "<|user|>": 5
+  },
+  "curriculum_note": "Ficbook's 50M first-pass + 250M second-pass split belongs to model-data scheduling; the tokenizer sees the aggregate 300M (30%) domain weight."
+}

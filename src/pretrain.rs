@@ -103,26 +103,40 @@ pub struct ModelConfig {
     /// Reuse one residual pseudo-query at every recurrent depth.
     #[serde(default = "default_true")]
     pub attn_residual_tied: bool,
+    /// Independent feature-subspace routing heads used by MHAR.
+    #[serde(default = "default_attn_residual_heads")]
+    pub attn_residual_heads: usize,
     /// Optional distance-to-final-latent bias; zero on language pretraining.
     #[serde(default)]
     pub attn_residual_depth_bias_distance: usize,
     /// Carry the full positive neuron workspace across depth within a chunk.
     #[serde(default)]
     pub gated_neuron_state: bool,
+    /// Initial fraction of newly computed full neuron state.
+    #[serde(default = "default_gated_neuron_state_initial_update")]
+    pub gated_neuron_state_initial_update: f64,
     /// Apply learned exponential retention to CQ fast weights.
     #[serde(default)]
     pub cq_memory_decay: bool,
     /// Initial CQ retention probability.
-    #[serde(default = "default_cq_retention")]
-    pub cq_memory_retention: f64,
+    #[serde(default = "default_cq_initial_rho")]
+    pub cq_memory_initial_rho: f64,
 }
 
 const fn default_true() -> bool {
     true
 }
 
-const fn default_cq_retention() -> f64 {
+const fn default_cq_initial_rho() -> f64 {
     0.995
+}
+
+const fn default_attn_residual_heads() -> usize {
+    1
+}
+
+const fn default_gated_neuron_state_initial_update() -> f64 {
+    0.2
 }
 
 /// AdamW and batch-scheduling settings.
@@ -305,6 +319,17 @@ impl PretrainConfig {
         if self.model.heads == 0 || !self.model.dim_qk_heads.is_multiple_of(self.model.heads) {
             return Err("dim_qk_heads must be divisible by a non-zero head count".into());
         }
+        if self.model.attn_residual
+            && (self.model.attn_residual_heads == 0
+                || !self
+                    .model
+                    .dim
+                    .is_multiple_of(self.model.attn_residual_heads))
+        {
+            return Err(
+                "model.dim must be divisible by a non-zero model.attn_residual_heads".into(),
+            );
+        }
         let qk_per_head = self.model.dim_qk_heads / self.model.heads;
         let rotary_dim = if self.model.rotary_dim == 0 {
             qk_per_head / 2
@@ -314,8 +339,13 @@ impl PretrainConfig {
         if rotary_dim > qk_per_head || !rotary_dim.is_multiple_of(2) {
             return Err("model.rotary_dim must be even and no greater than Q".into());
         }
-        if !(0.0 < self.model.cq_memory_retention && self.model.cq_memory_retention < 1.0) {
-            return Err("model.cq_memory_retention must be in (0, 1)".into());
+        if !(0.0 < self.model.gated_neuron_state_initial_update
+            && self.model.gated_neuron_state_initial_update < 1.0)
+        {
+            return Err("model.gated_neuron_state_initial_update must be in (0, 1)".into());
+        }
+        if !(0.0 < self.model.cq_memory_initial_rho && self.model.cq_memory_initial_rho < 1.0) {
+            return Err("model.cq_memory_initial_rho must be in (0, 1)".into());
         }
         for source in CorpusSource::all() {
             let budget = self.budget(source)?;
@@ -770,8 +800,17 @@ mod tests {
         assert_eq!(config.model.rotary_dim, 64);
         assert!(config.model.tie_embeddings);
         assert!(config.model.attn_residual);
+        assert_eq!(config.model.attn_residual_heads, 8);
         assert!(config.model.gated_neuron_state);
+        assert_eq!(config.model.gated_neuron_state_initial_update, 0.2);
         assert!(config.model.cq_memory_decay);
+        assert_eq!(config.memory.chunks_per_detach, 1);
+
+        let h1_control =
+            PretrainConfig::from_path("configs/rx6700-v2-pilot-attnres-state-h1.json").unwrap();
+        assert!(h1_control.model.attn_residual);
+        assert!(h1_control.model.gated_neuron_state);
+        assert_eq!(h1_control.model.attn_residual_heads, 1);
 
         let schedule = TrainingSchedule::build(&config).unwrap();
         let tolerance = (config.sequence_length
@@ -788,17 +827,20 @@ mod tests {
     #[test]
     fn all_v2_pilot_configs_are_fixed_budget_cq_ablations() {
         let cases = [
-            ("additive", false, false),
-            ("attnres", true, false),
-            ("state", false, true),
-            ("attnres-state", true, true),
+            ("additive", false, false, 8),
+            ("attnres", true, false, 8),
+            ("state", false, true, 8),
+            ("attnres-state", true, true, 8),
+            ("attnres-state-h1", true, true, 1),
         ];
-        for (name, attention_residual, neuron_state) in cases {
+        for (name, attention_residual, neuron_state, routing_heads) in cases {
             let path = format!("configs/rx6700-v2-pilot-{name}.json");
             let config = PretrainConfig::from_path(path).unwrap();
             assert_eq!(config.memory.stateful_after_tokens, 5_000_000);
+            assert_eq!(config.memory.chunks_per_detach, 1);
             assert_eq!(config.model.attn_residual, attention_residual);
             assert_eq!(config.model.gated_neuron_state, neuron_state);
+            assert_eq!(config.model.attn_residual_heads, routing_heads);
             assert_eq!(config.model.dim_qk_heads, 6_144);
             assert_eq!(
                 config.optimizer.micro_batch_size as u64

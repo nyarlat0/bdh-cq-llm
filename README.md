@@ -34,7 +34,7 @@ boundary precisely.
    packed-data format, RX 6700 XT profile, checkpoints, resume, and operations.
 9. [`docs/v2-training.md`](docs/v2-training.md) — the redesigned body-heavy
    model, full depth-local neuron state, decaying CQ, 1.05B replay schedule,
-   width benchmark, 2×2 pilots, and production gate.
+   width benchmark, 2×2 pilots, H=1 MHAR control, and production gate.
 
 Every public item is documented, and the dense tensor operations have inline
 shape annotations next to the implementation.
@@ -109,11 +109,11 @@ curriculum. Read [`docs/pretraining.md`](docs/pretraining.md) before starting a
 multi-day run.
 
 The new architecture-v2 run is intentionally separate. Prepare its body-only
-24,576-token ABI, benchmark the three body widths and run the four 20M-token
-pilots before starting production:
+24,576-token ABI, benchmark the three body widths, then run the four
+architecture pilots plus the H=1 routing control before starting production:
 
 ```console
-scripts/prepare_v2_data.sh /tmp/bdh-cq-tokenizer-venv/bin/python
+./scripts/prepare_v2_data.sh
 python3 scripts/benchmark_v2_widths.py 0
 scripts/run_v2_pilots.sh 0
 cargo run --release --bin train_llm -- --config configs/rx6700-v2.json
@@ -138,7 +138,8 @@ counts and replace the CPU backend for real experiments.
 - recurrent-depth weight sharing;
 - token ingestion, embedding ingestion, latent “think” stages, latent
   supervision, and answer next-token supervision;
-- optional Attention Residual history and its cycle-distance bias;
+- optional Multi-Head Attention Residual history (with H=1 compatibility) and
+  its cycle-distance bias;
 - optional full positive neuron state carried across recurrent depth, with a
   bounded input-dependent update gate;
 - optional learned per-head CQ decay, explicit RoPE width and tied token/LM

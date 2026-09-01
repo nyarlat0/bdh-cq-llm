@@ -75,7 +75,7 @@ fn ingest_and_generate_exercise_the_complete_protocol() {
         .unwrap();
     let prompt = task_prompt(&task, 3);
     let memory = ingest(&wrapper, &prompt, None, CHUNK_SIZE, true).unwrap();
-    assert_eq!(memory.tokens_seen, prompt.len());
+    assert_eq!(memory.position_offsets, vec![prompt.len()]);
 
     let generated = generate_answer(&wrapper, &task, 2, Some(memory), true, true, 0.0).unwrap();
     assert!(generated.len() <= answer_length(&task));

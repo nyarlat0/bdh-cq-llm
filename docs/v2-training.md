@@ -6,7 +6,8 @@ or imported because the vocabulary and tensor shapes are incompatible.
 
 The production config is [`configs/rx6700-v2.json`](../configs/rx6700-v2.json).
 It is the current **hypothesis**, not a claim that all new mechanisms help. The
-four fixed-budget pilots below are the acceptance gate before the long run.
+fixed-budget pilots and the H=1 routing control below are the acceptance gate
+before the long run.
 
 ## 1. Why this is a new model
 
@@ -25,7 +26,7 @@ is:
 |---|---:|
 | one tied `24576 × 512` vocabulary matrix | 12.58M |
 | shared `W_qk`, `W_up`, `W_out` at `H*Q=6144` | 9.44M |
-| state gates, Attention Residual and CQ decay | <0.01M |
+| state gates, multi-head Attention Residual and CQ decay | <0.01M |
 | total | about 22.03M |
 
 The total model is smaller, but the recurrent body is four times wider than
@@ -51,16 +52,19 @@ Let `Z_l` be the ordinary lifted/gated BDH activation with shape
 `[B,H,N,Q]`. V2 optionally carries another tensor of exactly that shape:
 
 ```text
-u_l = sigmoid(W_u X_l + logit(0.99))       [B,H,N,1]
+u_l = sigmoid(W_u X_l + raw_u)              [B,H,N,1]
 S_l = (1 - u_l) S_(l-1) + u_l Z_l          [B,H,N,Q]
 Y_l = LayerNorm(W_out concat(S_l))          [B,N,D]
 ```
 
 Before constructing Q/K at the next depth, normalized `S_l` can also be added
 to the positive gate through one learned strength per head. Those strengths
-start at zero. `W_u` starts at zero and the fixed offset makes `u≈0.99`, so
-the initial network is close to the stateless block instead of accidentally
-halving its activation.
+and `W_u` start at zero. `raw_u` is learned per BDH head and starts at
+`logit(0.2)`, so `u≈0.2`: a depth initially retains 80% of its preceding wide
+state and writes 20% of `Z_l`. At the first depth the absent previous state is
+zero, hence the wide output is initially `0.2 Z_0`; this is intentional and is
+covered by the architecture pilots rather than being hidden by an almost-open
+gate.
 
 This state is deliberately local to one `Bdh::forward` call. It survives the
 eight recurrent depths of a chunk and receives gradients through them, then is
@@ -68,22 +72,32 @@ discarded. Carrying `[B,H,N,Q]` between chunks would make state size depend on
 chunk length, retain token-aligned activations indefinitely and duplicate the
 job of CQ. Only the fixed-size CQ matrices cross chunk boundaries.
 
-### 2.3 Attention Residual
+### 2.3 Multi-Head Attention Residual (MHAR)
 
 When enabled, v2 replaces `X_l + Y_l` with learned attention over the seed
 state and all block deltas produced so far:
 
 ```text
-history_l = [X_0, Y_0, ..., Y_l]
-a_l       = softmax(<RMSNorm(history_l), p>)
-X_(l+1)   = sum_i a_(l,i) history_(l,i)
+history_l = [X_0, Y_0, ..., Y_l]                    [B,N,K,D]
+keys      = reshape(RMSNorm_D(history_l), K, R, D/R)
+a_(l,r)   = softmax_K(sum_d keys_(K,r,d) p_(r,d))
+X_(l+1)   = concat_r sum_K a_(l,r,K) history_(K,r)
 ```
 
-The pseudo-query `p` is tied across depth and the language-model config uses no
-cycle-distance bias. This matches the optional Attention Residual mechanism in
-the public reconstruction. It is not a disclosed part of Pathway's proprietary
-BDH-CQ update, which is why additive versus Attention Residual remains a pilot
-axis.
+The production candidate uses `R=8` routing heads, so each independently
+chooses a depth mixture for a contiguous 64-feature subspace of `D=512`.
+RMSNorm is applied over the complete `D` row before splitting it; the softmax
+is over history depth separately for every routing head. There is no
+`1/sqrt(d)` factor. The query is tied across recurrent BDH depth as requested,
+but contains all eight subqueries. It is zero-initialized, which makes every
+head a uniform history average at step zero. `R=1` is exactly the old
+single-query Attention Residual and has the same parameter count as `R=8`.
+
+This follows the Multi-Head Attention Residuals construction rather than
+simply copying the older single-query router. It is not a disclosed part of
+Pathway's proprietary BDH-CQ update. The 2×2 architecture grid still tests
+whether any attention residual helps, and an additional H=1 control isolates
+whether multi-head routing itself is useful on this model and corpus.
 
 ### 2.4 Decaying CQ memory
 
@@ -91,15 +105,19 @@ Each recurrent depth still owns one fixed fast-weight matrix
 `M_l: [B,H,Q,D]`. Its update is now:
 
 ```text
-r_h = sigmoid(rho_h)
-M_l <- r_h M_l + K_l^T V_l
+rho_h = sigmoid(raw_rho_h)
+M_l <- rho_h M_l + K_l^T V_l
 ```
 
-`r_h` is learned independently per head and starts at 0.995. If it remained at
-that value, its half-life would be about 138 chunks or 35.4K source tokens.
+`raw_rho_h` is an unconstrained learned scalar per CQ head, and its sigmoid
+starts at 0.995. If it remained at that value, its half-life would be about 138
+chunks or 35.4K source tokens.
 Decay prevents the unbounded magnitude growth of a purely additive sum while
-allowing training to learn longer or shorter retention. Logs report CQ RMS and
-absolute maximum so exploding state is visible.
+allowing training to learn longer or shorter retention. All rank-1 parameters
+(including `raw_rho`, `raw_u`, biases and normalization scales) are excluded
+from AdamW decay; matrices and embedding tables retain the configured decay.
+This prevents regularization alone from pulling sigmoid probabilities toward
+0.5. Logs report CQ RMS/maximum plus min/mean/max `rho` and base `u`.
 
 ### 2.5 Tied vocabulary matrix
 
@@ -115,20 +133,42 @@ There are three distinct horizons:
 | mechanism | production value | crosses chunks? |
 |---|---:|---|
 | exact local causal attention | 256 tokens | no |
-| gradient horizon through CQ (truncated BPTT) | 8 chunks = 2,048 tokens | gradients only |
-| CQ value lifetime | until `<|doc|>` or work-block reset | yes, detached every 8 chunks |
+| gradient horizon through CQ (truncated BPTT) | 1 chunk = 256 tokens | gradients only |
+| CQ value lifetime | until `<|doc|>` or work-block reset | yes, detached every chunk |
 
-Four stable lanes are trained concurrently. Every lane receives consecutive
-chunks from its own stripe and owns a separate `Memory`; no document can leak
-into another lane. A 256-sequence work block gives each lane up to 64 adjacent
-chunks, or 16,384 tokens, before the mandatory shuffle-boundary reset. A
-`<|doc|>` resets that lane earlier. The loader executes stateful lanes
-independently because their document resets and RoPE offsets differ; this is a
-correctness choice, and the hardware benchmark measures its real cost.
+Four stable lanes are trained concurrently in one physical `[4,256]` forward.
+Every lane receives consecutive chunks from its own stripe. `Memory` stores a
+batch of four independent CQ rows and four independent RoPE offsets. A
+256-sequence work block gives each lane up to 64 adjacent chunks, or 16,384
+tokens, before the mandatory shuffle-boundary reset.
+
+If `<|doc|>` appears at different positions in different lanes, row-major
+document-start flags produce per-token positions and three masks: local
+attention cannot cross the boundary, tokens at/after it cannot read the old CQ
+row, and only the final document in the chunk is written back. Other lanes are
+untouched. This preserves exact lane semantics without four serial B=1 calls;
+tests compare the batched result with independent reference forwards.
 
 CQ therefore supplements local context but does not turn the model into exact
 4096-token softmax attention. Tokens older than 256 are available only through
 the learned compressed associations in `M_l`.
+
+The detach interval is intentionally one chunk on the 12 GiB RX 6700 XT. An
+earlier eight-chunk pilot retained a 2,048-token autograd graph and requested
+about 26.4 GiB of Vulkan buffers. amdgpu consequently placed roughly 14.8 GiB
+in GTT/system memory, cutting stateful throughput by about five times. CQ
+*values* still cross every chunk and survive for the complete document; only
+the gradient path into the preceding chunk is cut. This is the original
+streaming schedule: `chunk -> Memory.detach() -> next chunk`.
+
+Burn/CubeCL's default sliced allocator also keeps completely free pages at its
+peak high-water mark unless an explicit cleanup is requested. The trainer now
+calls backend cleanup after every optimizer update and after validation. It
+also batches the sixteen scalar training losses on the GPU and performs one
+CPU readback per update rather than one per microbatch. Linux/amdgpu logs add
+`gpu_requested_mib`, `gpu_vram_mib` and `gpu_gtt_mib` after cleanup plus
+`gpu_peak_*_mib` immediately before it. Peak GTT at or above 1 GiB prints an
+explicit spill warning.
 
 ## 4. Data and schedule
 
@@ -172,15 +212,18 @@ pass nearly inert.
 Use the provided wrapper (its first optional argument is the Python executable):
 
 ```console
-scripts/prepare_v2_data.sh /tmp/bdh-cq-tokenizer-venv/bin/python
+./scripts/prepare_v2_data.sh
 ```
 
-It creates `artifacts/tokenizer-v2-24576.json` and
+With no argument the script creates an ignored, persistent
+`.venv-tokenizer/`, installs only the Python dataset-reader dependencies, then
+creates `artifacts/tokenizer-v2-24576.json` and
 `datasets/packed/rx6700-v2-24576/`. It does not use `--force`; existing data is
-never silently overwritten. The generated manifest records
-`ficbook_metadata_included: false`.
+never silently overwritten. Complete shards are validated and reused, so an
+interrupted packing run can be resumed by executing the same command. The
+generated manifest records `ficbook_metadata_included: false`.
 
-## 6. Hardware width check and 2×2 pilots
+## 6. Hardware width check, 2×2 pilots and H=1 control
 
 First compare `H*Q` 4096, 5120 and 6144 on one complete stateful work block:
 
@@ -192,7 +235,7 @@ The temporary runs live under `/tmp`. Select 6144 only if it fits with useful
 VRAM margin and its sustained speed is acceptable; otherwise change
 `dim_qk_heads` consistently in production and all pilot configs.
 
-Then run the architecture grid:
+Then run the architecture grid and routing control:
 
 ```console
 scripts/run_v2_pilots.sh 0
@@ -200,15 +243,23 @@ scripts/run_v2_pilots.sh 0
 
 Each run processes 1,220 updates = 19,988,480 tokens. Pilot-only CQ activation
 is accelerated to 5M so roughly 15M tokens exercise persistent memory. The
-four axes are additive, Attention Residual only, neuron state only, and both.
-They have isolated run directories and the launcher refuses to resume an old
-pilot, because unequal token budgets invalidate the comparison.
+four architecture cases are additive, MHAR only, neuron state only, and both.
+A fifth `attnres-state-h1` run is identical to the combined H=8 candidate except
+for classic single-query routing. They have isolated run directories and the
+launcher refuses to resume an old pilot, because unequal token budgets
+invalidate the comparison.
+
+Corrected pilots use fresh `runs/rx6700-v2-pilot-tbptt1-*` directories. The
+older pilot directories are deliberately preserved but must not be compared:
+their eight-chunk graphs spilled into GTT and ran under different hardware
+conditions.
 
 The final report uses stateful held-out loss, per-source BPB, finite-state
 checks and median throughput. A difference below roughly 1% is weak evidence;
-prefer the faster/simpler variant in that case. Copy only the winning
-`attn_residual` and `gated_neuron_state` settings into the production config
-before its run directory exists.
+prefer the faster/simpler variant in that case. First select the winning
+`attn_residual`/`gated_neuron_state` combination, then require H=8 to beat its
+H=1 control before retaining eight routing heads. Copy those settings into the
+production config before its run directory exists.
 
 ## 7. Production and monitoring
 

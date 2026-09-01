@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_memory(&prompt_memory);
 
     // Freeze fast-weight writes to make the state distinction observable:
-    // embeds and tokens_seen change, while every contextual matrix stays
+    // embeds and position_offsets change, while every contextual matrix stays
     // byte-for-byte the same. The unit suite checks that equality directly.
     let reasoned = wrapper.forward(
         &[Stage::Think(3)],
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_memory(memory: &bdh_cq_llm::Memory<Cpu>) {
-    println!("  positions seen: {}", memory.tokens_seen);
+    println!("  positions seen: {:?}", memory.position_offsets);
     println!("  latest embeddings: {:?}", memory.embeds.dims());
     for (depth, matrix) in memory.fast_weights.iter().enumerate() {
         println!(

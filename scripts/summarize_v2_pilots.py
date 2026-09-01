@@ -9,7 +9,7 @@ import statistics
 from pathlib import Path
 
 
-PILOTS = ("additive", "attnres", "state", "attnres-state")
+PILOTS = ("additive", "attnres", "state", "attnres-state", "attnres-state-h1")
 
 
 def load_events(path: Path) -> list[dict]:
@@ -26,7 +26,7 @@ def fmt(value: float | None, digits: int = 4) -> str:
 def main() -> None:
     rows: list[dict] = []
     for name in PILOTS:
-        events = load_events(Path(f"runs/rx6700-v2-pilot-{name}/train.jsonl"))
+        events = load_events(Path(f"runs/rx6700-v2-pilot-tbptt1-{name}/train.jsonl"))
         train = [event for event in events if event.get("event") == "train"]
         validation = [event for event in events if event.get("event") == "validation"]
         finite = bool(train and validation) and all(
@@ -62,11 +62,11 @@ def main() -> None:
         )
 
     print(
-        "pilot             finite  best-loss  last-loss  FineWeb-BPB  Ficbook-BPB  Classic-BPB  tok/s"
+        "pilot                finite  best-loss  last-loss  FineWeb-BPB  Ficbook-BPB  Classic-BPB  tok/s"
     )
     for row in rows:
         print(
-            f"{row['name']:<17} {str(row['finite']):<7} "
+            f"{row['name']:<20} {str(row['finite']):<7} "
             f"{fmt(row['best']):>9}  {fmt(row['last']):>9}  "
             f"{fmt(row['fineweb'], 3):>11}  {fmt(row['ficbook'], 3):>11}  "
             f"{fmt(row['classic'], 3):>11}  {fmt(row['speed'], 0):>5}"

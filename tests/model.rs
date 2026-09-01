@@ -1,6 +1,6 @@
 use bdh_cq_llm::{
-    BdhConfig, BdhForwardOptions, ModelInput, ReasoningForwardOptions, ReasoningWrapperConfig,
-    Stage, compute_attn_residual_depth_bias,
+    BdhConfig, BdhForwardOptions, ModelInput, MultiHeadAttentionResidual, ReasoningForwardOptions,
+    ReasoningWrapperConfig, Stage, compute_attn_residual_depth_bias,
 };
 use burn::{
     backend::{Autodiff, NdArray},
@@ -38,7 +38,7 @@ fn core_model_has_fixed_size_per_depth_memory() {
         .unwrap();
 
     assert_eq!(first.logits.unwrap().dims(), [2, 7, 16]);
-    assert_eq!(first.memory.tokens_seen, 7);
+    assert_eq!(first.memory.position_offsets, vec![7, 7]);
     assert_eq!(first.memory.fast_weights.len(), 2);
     assert!(
         first
@@ -55,7 +55,7 @@ fn core_model_has_fixed_size_per_depth_memory() {
             Default::default(),
         )
         .unwrap();
-    assert_eq!(second.memory.tokens_seen, 10);
+    assert_eq!(second.memory.position_offsets, vec![10, 10]);
     assert_eq!(second.logits.unwrap().dims(), [2, 3, 16]);
 }
 
@@ -136,8 +136,8 @@ fn padded_tail_does_not_change_real_logits_or_cq_memory() {
         )
         .unwrap();
 
-    assert_eq!(compact.memory.tokens_seen, 3);
-    assert_eq!(padded.memory.tokens_seen, 3);
+    assert_eq!(compact.memory.position_offsets, vec![3]);
+    assert_eq!(padded.memory.position_offsets, vec![3]);
     assert_eq!(padded.memory.embeds.dims(), [1, 16, 32]);
     padded
         .logits
@@ -179,7 +179,7 @@ fn wrapper_interleaves_tokens_and_latent_iterations() {
         .unwrap();
 
     assert_eq!(output.logits.unwrap().dims(), [1, 4, 16]);
-    assert_eq!(output.memory.tokens_seen, 5 + 3 + 4);
+    assert_eq!(output.memory.position_offsets, vec![5 + 3 + 4]);
 }
 
 #[test]
@@ -274,6 +274,295 @@ fn attention_residual_supports_recycling() {
 }
 
 #[test]
+fn mhar_h1_and_h2_match_at_uniform_zero_query_initialization() {
+    let device = Default::default();
+    let single = MultiHeadAttentionResidual::<TestBackend>::new(32, 1, 1, 0, &device);
+    let multi = MultiHeadAttentionResidual::<TestBackend>::new(32, 1, 2, 0, &device);
+
+    assert_eq!(single.num_params(), multi.num_params());
+    let first = Tensor::<TestBackend, 3>::from_data(
+        TensorData::new(
+            (0..64).map(|value| value as f32 / 10.0).collect(),
+            [1, 2, 32],
+        ),
+        &device,
+    );
+    let second = first.clone() * 0.5 + 1.0;
+    let sources = vec![first, second];
+    let single_read = single.forward([1, 2, 32], &sources, 0, 2, 1).unwrap();
+    let multi_read = multi.forward([1, 2, 32], &sources, 0, 2, 1).unwrap();
+    single_read
+        .into_data()
+        .assert_approx_eq::<f32>(&multi_read.into_data(), Tolerance::absolute(1e-5));
+}
+
+#[test]
+fn learned_probability_parameters_start_at_requested_values() {
+    let device = Default::default();
+    let model = tiny_config()
+        .with_gated_neuron_state(true)
+        .with_gated_neuron_state_initial_update(0.2)
+        .with_cq_memory_decay(true)
+        .with_cq_memory_initial_rho(0.995)
+        .init::<TestBackend>(&device)
+        .unwrap();
+    for value in model
+        .base_state_update_probabilities()
+        .unwrap()
+        .to_data()
+        .to_vec::<f32>()
+        .unwrap()
+    {
+        assert!((value - 0.2).abs() < 1e-6);
+    }
+    for value in model
+        .cq_retention_probabilities()
+        .unwrap()
+        .to_data()
+        .to_vec::<f32>()
+        .unwrap()
+    {
+        assert!((value - 0.995).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn selective_memory_reset_preserves_other_batch_rows() {
+    let device = Default::default();
+    let model = tiny_config().init::<TestBackend>(&device).unwrap();
+    let memory = model
+        .forward(
+            ModelInput::TokenIds(ids(2, 3, &device)),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+        .memory;
+    let kept_embed = memory.embeds.clone().slice([1..2, 0..3, 0..32]);
+    let kept_weights =
+        memory.fast_weights[0]
+            .as_ref()
+            .unwrap()
+            .clone()
+            .slice([1..2, 0..2, 0..64, 0..32]);
+    let reset = memory.reset_rows(&[true, false]).unwrap();
+
+    assert_eq!(reset.position_offsets, vec![0, 3]);
+    assert_eq!(
+        reset
+            .embeds
+            .clone()
+            .slice([0..1, 0..3, 0..32])
+            .abs()
+            .max()
+            .into_scalar(),
+        0.0
+    );
+    reset
+        .embeds
+        .clone()
+        .slice([1..2, 0..3, 0..32])
+        .into_data()
+        .assert_approx_eq::<f32>(&kept_embed.into_data(), Tolerance::absolute(0.0));
+    reset.fast_weights[0]
+        .as_ref()
+        .unwrap()
+        .clone()
+        .slice([1..2, 0..2, 0..64, 0..32])
+        .into_data()
+        .assert_approx_eq::<f32>(&kept_weights.into_data(), Tolerance::absolute(0.0));
+
+    let continued = model
+        .forward(
+            ModelInput::TokenIds(ids(2, 2, &device)),
+            Some(reset),
+            Default::default(),
+        )
+        .unwrap();
+    assert_eq!(continued.memory.position_offsets, vec![2, 5]);
+}
+
+#[test]
+fn in_chunk_document_boundaries_match_independent_documents() {
+    let device = Default::default();
+    TestBackend::seed(&device, 1_337);
+    let model = tiny_config()
+        .with_attn_residual(true)
+        .with_attn_residual_heads(2)
+        .with_gated_neuron_state(true)
+        .with_gated_neuron_state_initial_update(0.2)
+        .with_cq_memory_decay(true)
+        .with_cq_memory_initial_rho(0.995)
+        .init::<TestBackend>(&device)
+        .unwrap();
+
+    let prefix = Tensor::from_data(TensorData::new(vec![1_i64, 2, 3], [1, 3]), &device);
+    let old_memory = model
+        .forward(ModelInput::TokenIds(prefix), None, Default::default())
+        .unwrap()
+        .memory;
+    let chunk = Tensor::from_data(
+        TensorData::new(vec![4_i64, 5, 6, 7, 8, 9, 10], [1, 7]),
+        &device,
+    );
+    let combined = model
+        .forward(
+            ModelInput::TokenIds(chunk.clone()),
+            Some(old_memory.clone()),
+            BdhForwardOptions {
+                document_starts: Some(vec![false, false, true, false, false, true, false]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let before_boundary = model
+        .forward(
+            ModelInput::TokenIds(chunk.clone().slice([0..1, 0..2])),
+            Some(old_memory),
+            Default::default(),
+        )
+        .unwrap();
+    let middle_document = model
+        .forward(
+            ModelInput::TokenIds(chunk.clone().slice([0..1, 2..5])),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+    let final_document = model
+        .forward(
+            ModelInput::TokenIds(chunk.slice([0..1, 5..7])),
+            None,
+            Default::default(),
+        )
+        .unwrap();
+    let reference_logits = Tensor::cat(
+        vec![
+            before_boundary.logits.unwrap(),
+            middle_document.logits.unwrap(),
+            final_document.logits.as_ref().unwrap().clone(),
+        ],
+        1,
+    );
+
+    assert_eq!(combined.memory.position_offsets, vec![2]);
+    combined
+        .logits
+        .unwrap()
+        .into_data()
+        .assert_approx_eq::<f32>(&reference_logits.into_data(), Tolerance::absolute(1e-4));
+    for (combined_state, reference_state) in combined
+        .memory
+        .fast_weights
+        .into_iter()
+        .zip(final_document.memory.fast_weights)
+    {
+        combined_state.unwrap().into_data().assert_approx_eq::<f32>(
+            &reference_state.unwrap().into_data(),
+            Tolerance::absolute(1e-4),
+        );
+    }
+}
+
+#[test]
+fn batched_tbptt_matches_independent_lanes_with_different_boundaries() {
+    let device = Default::default();
+    TestBackend::seed(&device, 7_331);
+    let model = tiny_config()
+        .with_attn_residual(true)
+        .with_attn_residual_heads(2)
+        .with_gated_neuron_state(true)
+        .with_cq_memory_decay(true)
+        .init::<TestBackend>(&device)
+        .unwrap();
+
+    let prefix_values = vec![1_i64, 2, 3, 4, 5, 6];
+    let batched_prefix = Tensor::from_data(TensorData::new(prefix_values.clone(), [2, 3]), &device);
+    let batched_memory = model
+        .forward(
+            ModelInput::TokenIds(batched_prefix),
+            None,
+            Default::default(),
+        )
+        .unwrap()
+        .memory;
+    let lane_memories = (0..2)
+        .map(|row| {
+            let prefix = Tensor::from_data(
+                TensorData::new(prefix_values[row * 3..row * 3 + 3].to_vec(), [1, 3]),
+                &device,
+            );
+            model
+                .forward(ModelInput::TokenIds(prefix), None, Default::default())
+                .unwrap()
+                .memory
+        })
+        .collect::<Vec<_>>();
+
+    let chunk_values = vec![
+        7_i64, 8, 9, 10, 11, 12, // lane 0 resets before token 9
+        13, 14, 15, 1, 2, 3, // lane 1 resets before token 2
+    ];
+    let starts = vec![
+        false, false, true, false, false, false, false, false, false, false, true, false,
+    ];
+    let batched = model
+        .forward(
+            ModelInput::TokenIds(Tensor::from_data(
+                TensorData::new(chunk_values.clone(), [2, 6]),
+                &device,
+            )),
+            Some(batched_memory),
+            BdhForwardOptions {
+                document_starts: Some(starts.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(batched.memory.position_offsets, vec![4, 2]);
+
+    let batched_logits = batched.logits.unwrap();
+    for row in 0..2 {
+        let lane = model
+            .forward(
+                ModelInput::TokenIds(Tensor::from_data(
+                    TensorData::new(chunk_values[row * 6..row * 6 + 6].to_vec(), [1, 6]),
+                    &device,
+                )),
+                Some(lane_memories[row].clone()),
+                BdhForwardOptions {
+                    document_starts: Some(starts[row * 6..row * 6 + 6].to_vec()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        batched_logits
+            .clone()
+            .slice([row..row + 1, 0..6, 0..16])
+            .into_data()
+            .assert_approx_eq::<f32>(&lane.logits.unwrap().into_data(), Tolerance::absolute(1e-4));
+        for (batched_state, lane_state) in batched
+            .memory
+            .fast_weights
+            .iter()
+            .zip(lane.memory.fast_weights)
+        {
+            batched_state
+                .as_ref()
+                .unwrap()
+                .clone()
+                .slice([row..row + 1, 0..2, 0..64, 0..32])
+                .into_data()
+                .assert_approx_eq::<f32>(
+                    &lane_state.unwrap().into_data(),
+                    Tolerance::absolute(1e-4),
+                );
+        }
+    }
+}
+
+#[test]
 fn depth_bias_matches_upstream_indexing_examples() {
     let device = Default::default();
     let schedule = Tensor::<TestBackend, 1>::from_floats([0.5, 1.0], &device);
@@ -311,9 +600,11 @@ fn architecture_v2_features_compose_and_backpropagate() {
         .with_tie_embeddings(true)
         .with_attn_residual(true)
         .with_attn_residual_tied(true)
+        .with_attn_residual_heads(2)
         .with_gated_neuron_state(true)
+        .with_gated_neuron_state_initial_update(0.2)
         .with_cq_memory_decay(true)
-        .with_cq_memory_retention(0.99)
+        .with_cq_memory_initial_rho(0.99)
         .init::<TrainBackend>(&device)
         .unwrap();
 

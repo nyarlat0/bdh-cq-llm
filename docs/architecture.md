@@ -94,9 +94,11 @@ The same projection produces query, key, and later multiplicative gate. ReLU
 makes this large feature space non-negative. The unrotated `G` is kept for the
 gate because rotation introduces signed components.
 
-Only the first half of each head's `Q` features receives RoPE. That half must
-itself consist of pairs, explaining the validation rule that `Q` is divisible
-by four.
+The upstream-compatible default rotates the first half of each head. An
+explicit `rotary_dim` may select a narrower even prefix (v2 uses 64 of 768
+features); the remainder stays semantic and non-negative. RoPE consumes one
+position id per batch row and token rather than assuming all rows share a
+cursor.
 
 ### 4.2 Read current and past context
 
@@ -127,6 +129,13 @@ Q (K^T V) = (Q K^T) V
 The amount of stored contextual state does not grow with the number of old
 tokens. Its size grows with `B*L*H*Q*D` instead.
 
+`BdhForwardOptions::document_starts` can mark different reset positions in
+each batch row. A token after a reset cannot attend to earlier-document tokens
+inside the chunk or read the prior CQ row. RoPE restarts at zero for that row,
+and the stored write retains only the final document. This is how stateful
+training keeps one efficient batched forward without leaking documents across
+lanes.
+
 ### 4.3 Lift, gate, and communicate back down
 
 Each head has a learned `D -> Q` lift `W_up,h`:
@@ -149,7 +158,8 @@ The current chunk proposes:
 ```text
 ΔM_l = K_rot^T V                           [B,H,Q,D]
 M_l' = M_l + ΔM_l                          legacy additive update
-M_l' = sigmoid(ρ_h) M_l + ΔM_l             optional v2 learned decay
+ρ_h = sigmoid(raw_ρ_h)
+M_l' = ρ_h M_l + ΔM_l                      optional v2 learned decay
 M_l' = M_l                                 when update_memory = false
 ```
 
@@ -162,11 +172,11 @@ pass. If the physical length is `P` and only the first `N <= P` positions are
 real, the implementation zeros the trailing input embeddings once before the
 shared recurrent block. All block projections are bias-free; zero Q/K gates,
 the causal residual, and the memory read therefore keep that tail zero through
-every depth. Consequently padding contributes exactly zero to `ΔM_l` without
-building a separate mask in each recurrent pass. `Memory.tokens_seen` advances
-by `N`, while logits and `Memory.embeds` retain physical length `P` so the
-caller can keep a bounded set of GPU shapes. The production trainer uses `P` in
-`{16, 32, 64, 128, 256}` and masks padded target labels.
+every depth. Consequently padding contributes exactly zero to `ΔM_l`.
+`Memory.position_offsets[row]` advances by `N`, while logits and
+`Memory.embeds` retain physical length `P`. Stateful validation uses bounded
+physical buckets in `{16, 32, 64, 128, 256}`; production training normally
+uses one unpadded `[B,256]` call.
 
 ### 4.5 Recurrent residual
 
@@ -179,18 +189,23 @@ X_(l+1) = X_l + Y_l
 After `L` shared-block applications the output receives one final
 parameter-free LayerNorm. The optional Attention Residual replaces the
 identity branch `X_l` with a learned mixture of saved earlier depth/reasoning
-states. It is an experimental extension in the public repository, not a
-disclosed BDH-CQ component.
+states. Multi-Head Attention Residual divides `D` into contiguous feature
+subspaces and gives each one an independent softmax distribution over saved
+depths. Full-width RMSNorm is applied before the split, the learned query is
+zero-initialized, and H=1 exactly recovers the older single-query router. It is
+an experimental extension, not a disclosed BDH-CQ component.
 
 ### 4.6 Architecture-v2 depth-local neuron state
 
 The production-v2 experiment optionally retains the complete positive
 `[B,H,N,Q]` lift between applications of the shared block. A token/head scalar
-gate forms a bounded EMA and the next depth can inject an RMS-normalized copy
-into its Q/K gate. This is reset at every outer `forward`; it is not serialized
-inside [`Memory`](../src/model.rs), does not cross token chunks, and does not
-replace CQ. See [`v2-training.md`](v2-training.md) for its equations,
-initialization and 2×2 ablation.
+`u = sigmoid(W_u X + raw_u)` forms
+`S_l = (1-u)S_(l-1) + uZ_l`; `W_u` starts at zero and `raw_u` starts at
+`logit(0.2)`. The next depth can inject an RMS-normalized copy into its Q/K
+gate, with the injection strength initialized to zero. This state resets at
+every outer `forward`; it is not serialized inside [`Memory`](../src/model.rs),
+does not cross token chunks, and does not replace CQ. See
+[`v2-training.md`](v2-training.md) for the pilots.
 
 ## 5. Contextual memory versus latent workspace
 
@@ -207,10 +222,10 @@ position, feeds it back as a continuous embedding, and runs the model `R`
 times. If latent memory writes are enabled, thinking also modifies `S`; if
 disabled, each iteration can still read `S`, while all `M_l` remain frozen.
 
-`Memory.tokens_seen` advances for both real tokens and thought positions. It is
-the offset used by RoPE, so later chunks and latent passes do not reuse
-position zero. Physical padding declared through `valid_sequence_length` does
-not advance this counter.
+`Memory.position_offsets` contains one RoPE cursor per batch row. It advances
+for both real tokens and thought positions, resets independently at document
+boundaries, and is preserved across chunks. Physical padding declared through
+`valid_sequence_length` does not advance a cursor.
 
 ## 6. How a stage program executes
 

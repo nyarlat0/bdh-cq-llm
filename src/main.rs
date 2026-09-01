@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = model.forward(ModelInput::TokenIds(ids), None, Default::default())?;
 
     println!("logits: {:?}", output.logits.unwrap().dims());
-    println!("tokens seen: {}", output.memory.tokens_seen);
+    println!("position offsets: {:?}", output.memory.position_offsets);
     println!(
         "fast-weight matrices: {} layers of {:?}",
         output.memory.fast_weights.len(),

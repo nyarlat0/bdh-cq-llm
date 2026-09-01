@@ -30,8 +30,8 @@ pub mod tokenizer;
 
 pub use error::BdhError;
 pub use model::{
-    AttentionResidual, Bdh, BdhConfig, BdhForwardOptions, BdhOutput, FastWeight, Memory,
-    ModelInput, compute_attn_residual_depth_bias,
+    Bdh, BdhConfig, BdhForwardOptions, BdhOutput, FastWeight, Memory, ModelInput,
+    MultiHeadAttentionResidual, compute_attn_residual_depth_bias,
 };
 pub use reasoning::{
     GenerateOptions, ReasoningForwardOptions, ReasoningOutput, ReasoningWrapper,
