@@ -2,7 +2,7 @@
   "format_version": 2,
   "tokenizer": "artifacts/tokenizer-v2-24576.json",
   "packed_dir": "datasets/packed/rx6700-v2-24576",
-  "run_dir": "runs/rx6700-v2",
+  "run_dir": "runs/rx6700-v2-cq-ramp",
   "seed": 42,
   "sequence_length": 256,
   "block_sequences": 256,
@@ -49,8 +49,9 @@
     "gradient_clip_norm": 1.0
   },
   "memory": {
-    "stateful_after_tokens": 100000000,
-    "chunks_per_detach": 1,
+    "stateful_after_tokens": 10000000,
+    "memory_read_ramp_tokens": 20000000,
+    "chunks_per_detach": 2,
     "reset_on_document": true,
     "reset_on_work_block": true
   },

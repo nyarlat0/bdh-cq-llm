@@ -162,6 +162,13 @@ pub enum ModelInput<B: Backend> {
 pub struct BdhForwardOptions<B: Backend> {
     /// Whether this pass adds `K^T V` into every fast-weight matrix.
     pub update_memory: bool,
+    /// Fraction of the previous CQ state exposed to the current pass.
+    ///
+    /// Training uses this scalar for a short memory curriculum: writes and
+    /// retention proceed normally while the read path grows smoothly from
+    /// zero to one. Keeping the scale on the read avoids changing the
+    /// recurrent update `M' = rho * M + K^T V` or corrupting stored memory.
+    pub memory_read_scale: f64,
     /// Skip the vocabulary projection during purely latent computation.
     pub return_logits: bool,
     /// Keep each depth's residual output for inspection or recycling.
@@ -195,6 +202,7 @@ impl<B: Backend> Default for BdhForwardOptions<B> {
     fn default() -> Self {
         Self {
             update_memory: true,
+            memory_read_scale: 1.0,
             return_logits: true,
             collect_per_pass_hiddens: false,
             attention_history: None,
@@ -490,6 +498,7 @@ impl<B: Backend> BdhBlock<B> {
         previous_memory: Option<&Tensor<B, 4>>,
         neuron_state: Option<Tensor<B, 4>>,
         metadata: &SequenceMetadata<B>,
+        memory_read_scale: f64,
     ) -> BdhBlockOutput<B> {
         let [batch, sequence, dim] = tokens.dims();
 
@@ -540,7 +549,7 @@ impl<B: Backend> BdhBlock<B> {
         // qM is algebraically the same contraction as attention over every
         // old position, without retaining a growing token cache.
         if let Some(memory) = previous_memory {
-            let mut memory_read = q.matmul(memory.clone());
+            let mut memory_read = q.matmul(memory.clone()) * memory_read_scale;
             if let Some(mask) = &metadata.previous_memory_mask {
                 memory_read = memory_read * mask.clone();
             }
@@ -1169,6 +1178,14 @@ impl<B: Backend> Bdh<B> {
         initial_neuron_state: Option<Tensor<B, 4>>,
         options: BdhForwardOptions<B>,
     ) -> Result<(BdhOutput<B>, Option<Tensor<B, 4>>), BdhError> {
+        if !options.memory_read_scale.is_finite()
+            || !(0.0..=1.0).contains(&options.memory_read_scale)
+        {
+            return Err(BdhError::InvalidConfig(format!(
+                "memory_read_scale must be finite and in [0, 1], got {}",
+                options.memory_read_scale
+            )));
+        }
         let mut tokens = match input {
             ModelInput::TokenIds(ids) => self.embed_tokens(ids),
             ModelInput::Embeddings(embeddings) => {
@@ -1298,9 +1315,13 @@ impl<B: Backend> Bdh<B> {
                 memory_write,
                 neuron_state: next_neuron_state,
                 ..
-            } = self
-                .block
-                .forward(tokens.clone(), previous.as_ref(), neuron_state, &metadata);
+            } = self.block.forward(
+                tokens.clone(),
+                previous.as_ref(),
+                neuron_state,
+                &metadata,
+                options.memory_read_scale,
+            );
             neuron_state = next_neuron_state;
 
             let next_tokens = if let (Some(residual), Some(states)) =
@@ -1421,11 +1442,13 @@ fn retain_cq_per_neuron<B: Backend>(
 mod tests {
     use super::*;
     use burn::{
-        backend::NdArray,
-        tensor::{TensorData, Tolerance},
+        backend::{Autodiff, NdArray},
+        optim::GradientsParams,
+        tensor::{Int, TensorData, Tolerance},
     };
 
     type TestBackend = NdArray<f32>;
+    type TrainBackend = Autodiff<TestBackend>;
 
     #[test]
     fn wide_delta_transition_matches_the_v2_equations() {
@@ -1483,7 +1506,7 @@ mod tests {
             &device,
         );
         let metadata = sequence_metadata(1, 2, 2, &[0], None, &device).unwrap();
-        let output = block.forward(tokens, None, None, &metadata);
+        let output = block.forward(tokens, None, None, &metadata, 1.0);
         output.neuron_delta.into_data().assert_approx_eq::<f32>(
             &output
                 .neuron_state
@@ -1507,7 +1530,7 @@ mod tests {
         );
         let previous = Tensor::ones([1, 2, 2, 4], &device);
         let metadata = sequence_metadata(1, 2, 2, &[0], None, &device).unwrap();
-        let output = block.forward(tokens, None, Some(previous), &metadata);
+        let output = block.forward(tokens, None, Some(previous), &metadata, 1.0);
 
         let projected_delta = block.project_neuron_delta(output.neuron_delta.clone());
         output
@@ -1593,6 +1616,144 @@ mod tests {
                 [1, 2, 2, 3],
             ),
             Tolerance::absolute(1e-6),
+        );
+    }
+
+    #[test]
+    fn zero_cq_read_scale_hides_old_fast_weights_without_changing_offsets() {
+        let device = Default::default();
+        TestBackend::seed(&device, 707);
+        let model = BdhConfig::new(16, 16)
+            .with_depth(2)
+            .with_heads(2)
+            .with_dim_qk_heads(32)
+            .with_cq_memory_decay(true)
+            .init::<TestBackend>(&device)
+            .unwrap();
+        let prefix = model
+            .forward(
+                ModelInput::TokenIds(Tensor::<TestBackend, 2, Int>::from_data(
+                    TensorData::new(vec![1_i64, 2, 3, 4], [1, 4]),
+                    &device,
+                )),
+                None,
+                Default::default(),
+            )
+            .unwrap()
+            .memory;
+        let without_fast_weights = Memory {
+            position_offsets: prefix.position_offsets.clone(),
+            embeds: prefix.embeds.clone(),
+            fast_weights: (0..prefix.fast_weights.len()).map(|_| None).collect(),
+        };
+        let continuation = Tensor::<TestBackend, 2, Int>::from_data(
+            TensorData::new(vec![5_i64, 6, 7, 8], [1, 4]),
+            &device,
+        );
+        let hidden = model
+            .forward(
+                ModelInput::TokenIds(continuation.clone()),
+                Some(prefix.clone()),
+                BdhForwardOptions {
+                    memory_read_scale: 0.0,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .logits
+            .unwrap();
+        let absent = model
+            .forward(
+                ModelInput::TokenIds(continuation.clone()),
+                Some(without_fast_weights),
+                Default::default(),
+            )
+            .unwrap()
+            .logits
+            .unwrap();
+        let absent_data = absent.into_data();
+        hidden
+            .into_data()
+            .assert_approx_eq::<f32>(&absent_data, Tolerance::absolute(1e-6));
+
+        let visible = model
+            .forward(
+                ModelInput::TokenIds(continuation),
+                Some(prefix),
+                Default::default(),
+            )
+            .unwrap()
+            .logits
+            .unwrap();
+        let visible_values = visible.into_data().to_vec::<f32>().unwrap();
+        let absent_values = absent_data.to_vec::<f32>().unwrap();
+        assert!(
+            visible_values
+                .iter()
+                .zip(absent_values)
+                .any(|(with_memory, without_memory)| (with_memory - without_memory).abs() > 1e-6),
+            "a full CQ read unexpectedly had no effect"
+        );
+    }
+
+    #[test]
+    fn two_chunk_tbptt_exposes_exact_cq_decay_to_the_loss() {
+        let device = Default::default();
+        TrainBackend::seed(&device, 708);
+        let model = BdhConfig::new(16, 16)
+            .with_depth(2)
+            .with_heads(2)
+            .with_dim_qk_heads(32)
+            .with_cq_memory_decay(true)
+            .with_cq_memory_initial_rho(0.995)
+            .init::<TrainBackend>(&device)
+            .unwrap();
+        let ids = |values: [i64; 4]| {
+            Tensor::<TrainBackend, 2, Int>::from_data(
+                TensorData::new(values.to_vec(), [1, 4]),
+                &device,
+            )
+        };
+
+        // The detached prefix is the state entering a real TBPTT window. The
+        // first chunk constructs rho*M + write; the second reads that exact
+        // result, so its loss must have a path to raw_rho.
+        let prefix = model
+            .forward(
+                ModelInput::TokenIds(ids([1, 2, 3, 4])),
+                None,
+                Default::default(),
+            )
+            .unwrap()
+            .memory
+            .detach();
+        let first = model
+            .forward(
+                ModelInput::TokenIds(ids([5, 6, 7, 8])),
+                Some(prefix),
+                Default::default(),
+            )
+            .unwrap();
+        let second = model
+            .forward(
+                ModelInput::TokenIds(ids([9, 10, 11, 12])),
+                Some(first.memory),
+                Default::default(),
+            )
+            .unwrap();
+        let loss = second.logits.unwrap().square().mean();
+        let gradients = GradientsParams::from_grads(loss.backward(), &model);
+        let raw_rho = model.raw_rho.as_ref().expect("CQ decay is enabled");
+        let gradient = gradients
+            .get::<TestBackend, 2>(raw_rho.id)
+            .expect("two-chunk loss must reach raw_rho")
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(gradient.iter().all(|value| value.is_finite()));
+        assert!(
+            gradient.iter().any(|value| value.abs() > 1e-12),
+            "raw_rho received only zero gradients"
         );
     }
 }

@@ -51,6 +51,7 @@
   "memory": {
     "stateful_after_tokens": 5000000,
     "chunks_per_detach": 1,
+    "allow_fixed_decay_with_single_chunk": true,
     "reset_on_document": true,
     "reset_on_work_block": true
   },

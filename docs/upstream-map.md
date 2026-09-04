@@ -135,3 +135,10 @@ true deltas. The one-position wide state may cross iterations inside one
 `Think(R)` call through `LatentWorkspace`, but never crosses ordinary token
 chunks or enters CQ. MHAR follows its separately cited paper; none of these v2
 choices is evidence about Pathway's undisclosed BDH-CQ internals.
+
+V2's training curriculum is likewise local rather than an upstream claim. It
+uses a 10M-token memoryless/LR warm-up followed by a 20M-token scalar ramp on
+the CQ read. The exact state transition remains `M' = rho*M + K^T V`.
+Production TBPTT spans two chunks because `rho` written at chunk `t` can only
+affect a loss when chunk `t+1` reads that state; the old one-chunk pilots kept
+the initialized retention fixed.

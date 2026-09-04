@@ -252,6 +252,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                                 total_reasoning_iterations,
                                 valid_sequence_length: None,
                                 document_starts: None,
+                                memory_read_scale: 1.0,
                             },
                         )?;
                         wide_workspace = next_workspace;
@@ -290,6 +291,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                             total_reasoning_iterations: 0,
                             valid_sequence_length: None,
                             document_starts: None,
+                            memory_read_scale: 1.0,
                         },
                     )?;
                     logits = output.logits;
@@ -313,6 +315,7 @@ impl<B: Backend> ReasoningWrapper<B> {
                             total_reasoning_iterations: 0,
                             valid_sequence_length: None,
                             document_starts: None,
+                            memory_read_scale: 1.0,
                         },
                     )?;
                     logits = output.logits;

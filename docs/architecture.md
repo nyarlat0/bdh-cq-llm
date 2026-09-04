@@ -119,9 +119,14 @@ History is represented by one associative matrix per depth:
 
 ```text
 M_l = Σ_old K_old^T V_old                 [B,H,Q,D]
-A_past = Q_rot M_l                        [B,H,N,D]
+A_past = gamma Q_rot M_l                  [B,H,N,D]
 A = LayerNorm(A_current + A_past)
 ```
+
+Normally `gamma=1`. Architecture-v2 pretraining may ramp this scalar from zero
+to one after its memoryless warm-up. The ramp changes only how much stored CQ
+is read by the current chunk: writes and the exact recurrent update remain
+unchanged, so the stored state is never rescaled or replaced by a surrogate.
 
 This is exact for the reconstruction's unnormalized linear attention because
 matrix multiplication is associative:
@@ -170,6 +175,11 @@ M_l' = M_l                                 when update_memory = false
 The block always computes its local write because it is also useful for a
 fresh state; the model decides whether to commit it. Every recurrent depth has
 its own `M_l`, even though all depths share `W_qk`, `W_up`, and `W_out`.
+The logits of chunk `t` read `M_t`, while `rho` first appears in
+`M_(t+1) = rho*M_t + DeltaM_t`. Consequently exact learning of `raw_rho`
+requires at least two consecutive chunks in one autograd graph. Detaching
+after every chunk preserves CQ values but makes `raw_rho` unreachable from all
+losses; v2 production validation rejects that combination.
 
 `BdhForwardOptions::valid_sequence_length` supports a physically padded token
 pass. If the physical length is `P` and only the first `N <= P` positions are

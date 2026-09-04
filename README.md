@@ -120,6 +120,11 @@ sweep. The measured tables and curves are in
 cargo run --release --bin train_llm -- --config configs/rx6700-v2.json
 ```
 
+The production config writes to `runs/rx6700-v2-cq-ramp`; it deliberately does
+not resume or import the discarded `runs/rx6700-v2` experiment. CQ starts
+after the 10M-token LR warm-up, its read is ramped to full strength over 20M
+tokens, and exact learned decay uses two-chunk TBPTT.
+
 These commands do not add chat-role labels or content filters. See
 [`docs/v2-training.md`](docs/v2-training.md) for the exact schedule and
 monitoring protocol. The benchmark and pilot launchers remain available for

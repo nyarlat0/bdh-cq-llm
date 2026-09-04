@@ -136,6 +136,7 @@ struct LogEvent<'a> {
     tokens_seen: u64,
     phase: CurriculumPhase,
     mode: &'a str,
+    cq_read_scale: f64,
     loss: f32,
     learning_rate: f64,
     tokens_per_second: f64,
@@ -211,6 +212,7 @@ struct ValidationLogEvent<'a> {
     step: u64,
     tokens_seen: u64,
     mode: &'a str,
+    cq_read_scale: f64,
     memoryless_loss: f32,
     stateful_loss: Option<f32>,
     selected_loss: f32,
@@ -389,6 +391,14 @@ fn main() -> Result<(), AnyError> {
     println!(
         "GPU allocator: explicit CubeCL cleanup after every optimizer update; loss readback once/update"
     );
+    if config.memory.stateful_after_tokens == u64::MAX {
+        println!("CQ curriculum: persistent memory is disabled");
+    } else {
+        println!(
+            "CQ curriculum: memoryless through {} tokens, then read scale 0->1 over {} tokens; mode is fixed per optimizer update",
+            config.memory.stateful_after_tokens, config.memory.memory_read_ramp_tokens,
+        );
+    }
     let adam = AdamWConfig::new()
         .with_beta_1(config.optimizer.beta_1)
         .with_beta_2(config.optimizer.beta_2)
@@ -462,8 +472,10 @@ fn main() -> Result<(), AnyError> {
     if config.memory.is_stateful(state.tokens_seen) && state.cq_activation_tokens.is_none() {
         state.cq_activation_tokens = Some(state.tokens_seen);
         println!(
-            "stateful CQ activates at imported cursor {} (configured threshold {})",
-            state.tokens_seen, config.memory.stateful_after_tokens
+            "stateful CQ is active at startup cursor {} (configured threshold {}, read scale {:.4})",
+            state.tokens_seen,
+            config.memory.stateful_after_tokens,
+            config.memory.memory_read_scale(state.tokens_seen),
         );
     }
 
@@ -574,12 +586,21 @@ where
             println!("training schedule complete; final checkpoint saved");
             break;
         };
-        let stateful = config.memory.is_stateful(state.tokens_seen);
+        // Curriculum mode is an optimizer-step property. In particular, do
+        // not mix memoryless and stateful microbatches in one accumulated
+        // gradient merely because a token threshold fell inside that update.
+        let stateful = config.memory.is_stateful(step_start_state.tokens_seen);
+        let cq_read_scale = config
+            .memory
+            .memory_read_scale(step_start_state.tokens_seen);
         if stateful && state.cq_activation_tokens.is_none() {
-            state.cq_activation_tokens = Some(state.tokens_seen);
+            state.cq_activation_tokens = Some(step_start_state.tokens_seen);
             memory = None;
             chunks_in_graph = 0;
-            println!("stateful CQ activated at {} tokens", state.tokens_seen);
+            println!(
+                "stateful CQ activated at {} tokens (read scale {:.4})",
+                step_start_state.tokens_seen, cq_read_scale,
+            );
         }
         if stateful && batch.block_started && config.memory.reset_on_work_block {
             memory = None;
@@ -596,6 +617,7 @@ where
                 document_token,
                 config.memory.reset_on_document,
                 &mut state.document_resets,
+                cq_read_scale,
                 vocabulary,
                 device,
             )?
@@ -719,11 +741,8 @@ where
                 step: state.optimizer_step,
                 tokens_seen: state.tokens_seen,
                 phase: batch.phase,
-                mode: if stateful {
-                    "stateful_cq"
-                } else {
-                    "memoryless"
-                },
+                mode: memory_mode(stateful, cq_read_scale),
+                cq_read_scale,
                 loss: mean_loss,
                 learning_rate,
                 tokens_per_second: interval_tokens as f64 / interval_seconds,
@@ -755,10 +774,11 @@ where
             };
             append_json_line(&log_path, &event)?;
             println!(
-                "step {:>7} | {:?} | {} | tokens {:>10} | loss {:.5} | lr {:.3e} | {:.0} tok/s | memory {}",
+                "step {:>7} | {:?} | {} | cq-read {:.3} | tokens {:>10} | loss {:.5} | lr {:.3e} | {:.0} tok/s | memory {}",
                 event.step,
                 event.phase,
                 event.mode,
+                event.cq_read_scale,
                 event.tokens_seen,
                 event.loss,
                 event.learning_rate,
@@ -786,6 +806,7 @@ where
                 tokenizer,
                 device,
                 stateful,
+                cq_read_scale,
             )?;
             // Validation creates a second set of inference-only temporary
             // buffers in the same Vulkan runtime. Do not let that high-water
@@ -821,11 +842,8 @@ where
                     event: "validation",
                     step: state.optimizer_step,
                     tokens_seen: state.tokens_seen,
-                    mode: if stateful {
-                        "stateful_cq"
-                    } else {
-                        "memoryless"
-                    },
+                    mode: memory_mode(stateful, cq_read_scale),
+                    cq_read_scale,
                     memoryless_loss: validation.memoryless,
                     stateful_loss: validation.stateful,
                     selected_loss: selected,
@@ -901,6 +919,16 @@ where
     Ok(())
 }
 
+fn memory_mode(stateful: bool, cq_read_scale: f64) -> &'static str {
+    if !stateful {
+        "memoryless"
+    } else if cq_read_scale < 1.0 {
+        "stateful_cq_ramp"
+    } else {
+        "stateful_cq"
+    }
+}
+
 fn memoryless_chunk_loss(
     model: &Bdh<TrainingBackend>,
     criterion: &burn::nn::loss::CrossEntropyLoss<TrainingBackend>,
@@ -931,6 +959,7 @@ fn stateful_chunk_loss(
     document_token: i64,
     reset_on_document: bool,
     document_resets: &mut u64,
+    memory_read_scale: f64,
     vocabulary: usize,
     device: &WgpuDevice,
 ) -> Result<Tensor<TrainingBackend, 1>, AnyError> {
@@ -964,6 +993,7 @@ fn stateful_chunk_loss(
         memory.take(),
         BdhForwardOptions {
             document_starts,
+            memory_read_scale,
             ..Default::default()
         },
     )?;
@@ -1321,6 +1351,7 @@ fn validate(
     tokenizer: &Tokenizer,
     device: &WgpuDevice,
     stateful: bool,
+    memory_read_scale: f64,
 ) -> Result<ValidationMetrics, AnyError> {
     let inference = model.clone().valid();
     let criterion = CrossEntropyLossConfig::new().init(device);
@@ -1344,7 +1375,7 @@ fn validate(
         let sequence_index = (index / 3) as u64;
         let batch = loader.validation_batch(source, sequence_index, 1)?;
         let memoryless = inference_chunk_loss(
-            &inference, &criterion, &batch, None, None, vocabulary, device,
+            &inference, &criterion, &batch, None, None, 0.0, vocabulary, device,
         )?
         .0;
         let target_tokens = batch.targets.len() as u64;
@@ -1391,6 +1422,7 @@ fn validate(
                     &segment_batch,
                     memory,
                     Some(length),
+                    memory_read_scale,
                     vocabulary,
                     device,
                 )?;
@@ -1455,6 +1487,7 @@ fn inference_chunk_loss(
     batch: &TokenBatch,
     memory: Option<Memory<InferenceBackend>>,
     valid_sequence_length: Option<usize>,
+    memory_read_scale: f64,
     vocabulary: usize,
     device: &WgpuDevice,
 ) -> Result<(f32, Option<Memory<InferenceBackend>>), AnyError> {
@@ -1469,6 +1502,7 @@ fn inference_chunk_loss(
         memory,
         BdhForwardOptions {
             valid_sequence_length,
+            memory_read_scale,
             ..Default::default()
         },
     )?;
@@ -1939,6 +1973,14 @@ mod tests {
         let mut gate = CheckpointGate::default();
         gate.request(true);
         assert!(gate.finish_optimizer_step(false));
+    }
+
+    #[test]
+    fn cq_log_mode_distinguishes_the_read_ramp() {
+        assert_eq!(memory_mode(false, 0.0), "memoryless");
+        assert_eq!(memory_mode(true, 0.0), "stateful_cq_ramp");
+        assert_eq!(memory_mode(true, 0.5), "stateful_cq_ramp");
+        assert_eq!(memory_mode(true, 1.0), "stateful_cq");
     }
 
     #[test]

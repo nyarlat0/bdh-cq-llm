@@ -132,6 +132,14 @@ M_l <- rho ⊙ M_l + K_l^T V_l
 138 chunks or 35.4K source tokens.
 Decay prevents the unbounded magnitude growth of a purely additive sum while
 allowing individual neuron coordinates to learn longer or shorter retention.
+
+The update ordering is deliberately exact: chunk `t` reads `M_t` and only
+then constructs `M_(t+1) = rho*M_t + K_t^T V_t`. Therefore `rho` first affects
+the loss of chunk `t+1`. Production keeps two adjacent chunks in each TBPTT
+graph; one-chunk TBPTT would silently leave `raw_rho` at its initialization.
+Config validation rejects learned decay with `chunks_per_detach < 2`, except
+for an explicitly marked historical-pilot compatibility mode.
+
 All rank-1 parameters plus the semantic `[H,Q]` arrays `raw_rho`, `raw_u` and
 `raw_alpha` are excluded from AdamW decay; projection matrices and embedding
 tables retain the configured decay. Logs report CQ RMS/maximum plus
@@ -164,7 +172,7 @@ There are three distinct horizons:
 | mechanism | production value | crosses chunks? |
 |---|---:|---|
 | exact local causal attention | 256 tokens | no |
-| gradient horizon through CQ (truncated BPTT) | 1 chunk = 256 tokens | gradients only |
+| gradient horizon through CQ (truncated BPTT) | 2 chunks = 512 tokens | gradients only |
 | CQ value lifetime | until `<|doc|>` or work-block reset | yes, detached every chunk |
 
 Four stable lanes are trained concurrently in one physical `[4,256]` forward.
@@ -184,13 +192,21 @@ CQ therefore supplements local context but does not turn the model into exact
 4096-token softmax attention. Tokens older than 256 are available only through
 the learned compressed associations in `M_l`.
 
-The detach interval is intentionally one chunk on the 12 GiB RX 6700 XT. An
-earlier eight-chunk pilot retained a 2,048-token autograd graph and requested
-about 26.4 GiB of Vulkan buffers. amdgpu consequently placed roughly 14.8 GiB
-in GTT/system memory, cutting stateful throughput by about five times. CQ
-*values* still cross every chunk and survive for the complete document; only
-the gradient path into the preceding chunk is cut. This is the original
-streaming schedule: `chunk -> Memory.detach() -> next chunk`.
+The detach interval is the minimum two chunks required to train exact CQ
+decay. An earlier eight-chunk pilot retained a 2,048-token autograd graph and
+requested about 26.4 GiB of Vulkan buffers. amdgpu consequently placed roughly
+14.8 GiB in GTT/system memory, cutting stateful throughput by about five times.
+CQ *values* still cross every detach and survive for the complete document;
+only the gradient graph is bounded. Production therefore executes
+`chunk t -> chunk t+1 -> Memory.detach()`, giving `raw_rho` a real downstream
+loss without returning to the spilling eight-chunk graph.
+
+A four-update production-width smoke with `rotary_dim=384` measured a steady
+approximately 2.54K tok/s, 9,881 MiB peak requested/resident VRAM and 6 MiB
+GTT on the tested card. This confirms that the complete two-chunk graph fits
+without system-memory spill. It also supersedes the faster one-chunk pilot
+throughput for wall-clock planning: the full 1.05B-token schedule is roughly
+115 hours (about 4.8 days) if that short-smoke rate is sustained.
 
 Burn/CubeCL's default sliced allocator also keeps completely free pages at its
 peak high-water mark unless an explicit cleanup is requested. The trainer now
@@ -232,11 +248,32 @@ After whole-sequence and optimizer-boundary trimming, the deterministic
 schedule is 1,049,985,024 target tokens and 64,086 optimizer updates. One
 update contains `4 lanes × 16 microbatches × 256 = 16,384` target tokens.
 
-CQ is disabled for the first 100M processed tokens. Phase-one LR warms for 10M
-tokens to `3e-4`, then cosines to `8e-5`. At the approximately 750M phase
-boundary it warms for 5M from `8e-5` to `1.2e-4`, then cosines to `3e-5`. The
-focus re-warm prevents the old late-stage tiny LR from making the 250M Ficbook
-pass nearly inert.
+CQ is memoryless during the 10M-token LR warm-up. At that optimizer-step
+boundary it starts carrying CQ values, while the previous-memory read uses
+
+```text
+gamma(t) = clamp((t - 10M) / 20M, 0, 1)
+A_past   = gamma(t) Q M
+```
+
+Thus full CQ influence is reached at 30M tokens instead of waiting until
+100M. Writes and `M' = rho*M + K^T V` are active throughout the ramp; only the
+read contribution is annealed. The mode and `gamma` are sampled from the token
+cursor at the start of an optimizer update and held fixed for all 16
+microbatches, so one gradient update never mixes two curriculum objectives.
+
+Starting CQ at token zero is plausible in recurrent architectures, but the
+completed v2 pilots did not test that condition and therefore cannot guarantee
+that it is harmless while both the model and LR are in their initial
+transient. Conversely, the old 100M hard switch had no experimental basis and
+withheld the production objective for too long. Aligning activation with the
+already configured 10M LR warm-up and ramping for 20M is the conservative
+middle ground.
+
+Phase-one LR warms for 10M tokens to `3e-4`, then cosines to `8e-5`. At the
+approximately 750M phase boundary it warms for 5M from `8e-5` to `1.2e-4`,
+then cosines to `3e-5`. The focus re-warm prevents the old late-stage tiny LR
+from making the 250M Ficbook pass nearly inert.
 
 ## 5. Data preparation
 
@@ -315,9 +352,10 @@ After the width and pilot decisions:
 cargo run --release --bin train_llm -- --config configs/rx6700-v2.json
 ```
 
-Validation events are appended to `runs/rx6700-v2/train.jsonl`. They contain
+Validation events are appended to `runs/rx6700-v2-cq-ramp/train.jsonl`. They contain
 memoryless and stateful loss, perplexity and decoded UTF-8 bits/byte separately
-for FineWeb, Ficbook and classics. `checkpoints/latest.json` names the resume
+for FineWeb, Ficbook and classics, plus the active `cq_read_scale`.
+`checkpoints/latest.json` names the resume
 checkpoint; `checkpoints/best.json` protects the best validated checkpoint
 from normal pruning. Train loss is intentionally noisy and must not be used as
 the sole convergence signal.
@@ -325,7 +363,7 @@ the sole convergence signal.
 For a graceful stop:
 
 ```console
-touch runs/rx6700-v2/STOP
+touch runs/rx6700-v2-cq-ramp/STOP
 ```
 
 The trainer saves at the next safe block boundary and exits. A first Ctrl+C

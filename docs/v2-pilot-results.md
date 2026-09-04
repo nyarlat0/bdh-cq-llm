@@ -15,6 +15,15 @@ and the 24,576-token v2 vocabulary. Each run stopped after 1,220 optimizer
 updates or 19,988,480 training tokens. CQ was enabled after 5M tokens so that
 about 15M tokens exercised cross-chunk memory.
 
+All historical pilots detached the graph after one chunk. They therefore
+tested stateful CQ with retention fixed at its initialized `rho=0.995`, not
+learned decay: under the exact update ordering, `rho` enters the next memory
+and needs the following chunk's loss. This limitation affects every row
+equally, so the paired architecture and RoPE rankings remain useful, but the
+reported runs are not evidence about learned per-neuron retention. Their
+configs carry `allow_fixed_decay_with_single_chunk=true` solely to remain
+reproducible; production uses two-chunk TBPTT and trains `raw_rho`.
+
 The reported held-out values come from the final stateful validation at step
 1,125 (18,432,000 training tokens). `best-loss` equals `last-loss` for every
 completed run, so none of the pilots had turned upward by its last validation.
@@ -98,11 +107,13 @@ The selected v2 model is:
 - `rotary_dim=384` and 256-token local chunks;
 - 22,043,648 learned parameters.
 
-At the measured 3.1K tok/s, the 1,049,985,024-token production schedule is
-expected to require about 94 hours of uninterrupted training. The pilot ranking
-is not a promise about final model quality: production monitoring must continue
-to compare memoryless/stateful validation and per-source BPB throughout the
-run.
+The old 3.1K tok/s pilot rate implied about 94 hours, but those pilots used
+one-chunk TBPTT and did not train `rho`. A subsequent production-width
+two-chunk smoke with RoPE 384 sustained approximately 2.54K tok/s, peaked at
+9,881 MiB VRAM with only 6 MiB GTT, and raises the practical estimate to about
+115 hours (4.8 days). The pilot ranking is not a promise about final model
+quality: production monitoring must continue to compare memoryless/stateful
+validation and per-source BPB throughout the run.
 
 ## Reproducing the report
 

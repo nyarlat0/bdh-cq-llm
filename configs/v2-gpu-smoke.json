@@ -50,7 +50,8 @@
   },
   "memory": {
     "stateful_after_tokens": 0,
-    "chunks_per_detach": 1,
+    "memory_read_ramp_tokens": 0,
+    "chunks_per_detach": 2,
     "reset_on_document": true,
     "reset_on_work_block": true
   },

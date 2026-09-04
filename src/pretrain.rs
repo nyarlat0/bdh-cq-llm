@@ -198,8 +198,21 @@ pub struct FocusReplayConfig {
 pub struct MemoryTrainingConfig {
     /// Global token count at which adjacent chunks start sharing CQ memory.
     pub stateful_after_tokens: u64,
+    /// Tokens over which the previous-memory read grows linearly from 0 to 1.
+    ///
+    /// Zero preserves the historical hard switch. The memory state is already
+    /// written and retained during the ramp; only its contribution to the
+    /// current block is scaled.
+    pub memory_read_ramp_tokens: u64,
     /// Number of 256-token chunks kept in one truncated-BPTT graph.
     pub chunks_per_detach: usize,
+    /// Explicitly permit fixed CQ decay when TBPTT contains only one chunk.
+    ///
+    /// With exact `M' = rho*M + write` ordering, `rho` first affects the next
+    /// chunk's loss. A one-chunk graph therefore cannot train `raw_rho`. This
+    /// escape hatch exists only to reproduce historical pilots that used the
+    /// initialized fixed retention.
+    pub allow_fixed_decay_with_single_chunk: bool,
     /// Reset memory whenever the packed `<|doc|>` marker starts a new document.
     pub reset_on_document: bool,
     /// Reset at shuffled work-block boundaries, which are not text-contiguous.
@@ -210,7 +223,9 @@ impl Default for MemoryTrainingConfig {
     fn default() -> Self {
         Self {
             stateful_after_tokens: u64::MAX,
+            memory_read_ramp_tokens: 0,
             chunks_per_detach: 1,
+            allow_fixed_decay_with_single_chunk: false,
             reset_on_document: true,
             reset_on_work_block: true,
         }
@@ -221,6 +236,20 @@ impl MemoryTrainingConfig {
     /// Whether the current global token cursor has entered the CQ stage.
     pub fn is_stateful(&self, tokens_seen: u64) -> bool {
         tokens_seen >= self.stateful_after_tokens
+    }
+
+    /// Linear CQ-read curriculum at a completed optimizer-step cursor.
+    pub fn memory_read_scale(&self, tokens_seen: u64) -> f64 {
+        if !self.is_stateful(tokens_seen) {
+            return 0.0;
+        }
+        if self.memory_read_ramp_tokens == 0 {
+            return 1.0;
+        }
+        tokens_seen
+            .saturating_sub(self.stateful_after_tokens)
+            .min(self.memory_read_ramp_tokens) as f64
+            / self.memory_read_ramp_tokens as f64
     }
 }
 
@@ -311,6 +340,20 @@ impl PretrainConfig {
         }
         if self.memory.chunks_per_detach == 0 {
             return Err("memory.chunks_per_detach must be non-zero".into());
+        }
+        if self.memory.stateful_after_tokens == u64::MAX && self.memory.memory_read_ramp_tokens != 0
+        {
+            return Err("memory_read_ramp_tokens requires finite stateful_after_tokens".into());
+        }
+        if self.model.cq_memory_decay
+            && self.memory.stateful_after_tokens != u64::MAX
+            && self.memory.chunks_per_detach < 2
+            && !self.memory.allow_fixed_decay_with_single_chunk
+        {
+            return Err(
+                "learned CQ decay needs memory.chunks_per_detach >= 2; set allow_fixed_decay_with_single_chunk=true only to reproduce a fixed-rho historical run"
+                    .into(),
+            );
         }
         if self.memory.stateful_after_tokens != u64::MAX
             && !self
@@ -817,7 +860,10 @@ mod tests {
         assert_eq!(config.model.gated_neuron_state_initial_injection, 0.05);
         assert!(config.model.normalize_each_depth);
         assert!(config.model.cq_memory_decay);
-        assert_eq!(config.memory.chunks_per_detach, 1);
+        assert_eq!(config.memory.stateful_after_tokens, 10_000_000);
+        assert_eq!(config.memory.memory_read_ramp_tokens, 20_000_000);
+        assert_eq!(config.memory.chunks_per_detach, 2);
+        assert!(!config.memory.allow_fixed_decay_with_single_chunk);
 
         let h1_control =
             PretrainConfig::from_path("configs/rx6700-v2-pilot-attnres-state-h1.json").unwrap();
@@ -851,6 +897,7 @@ mod tests {
             let config = PretrainConfig::from_path(path).unwrap();
             assert_eq!(config.memory.stateful_after_tokens, 5_000_000);
             assert_eq!(config.memory.chunks_per_detach, 1);
+            assert!(config.memory.allow_fixed_decay_with_single_chunk);
             assert_eq!(config.model.attn_residual, attention_residual);
             assert_eq!(config.model.gated_neuron_state, neuron_state);
             assert_eq!(config.model.attn_residual_heads, routing_heads);
@@ -878,5 +925,38 @@ mod tests {
             config.run_dir = baseline.run_dir.clone();
             assert_eq!(config, baseline);
         }
+    }
+
+    #[test]
+    fn cq_read_curriculum_has_exact_endpoints_and_linear_interior() {
+        let memory = MemoryTrainingConfig {
+            stateful_after_tokens: 10_000_000,
+            memory_read_ramp_tokens: 20_000_000,
+            chunks_per_detach: 2,
+            allow_fixed_decay_with_single_chunk: false,
+            reset_on_document: true,
+            reset_on_work_block: true,
+        };
+        assert_eq!(memory.memory_read_scale(9_999_999), 0.0);
+        assert_eq!(memory.memory_read_scale(10_000_000), 0.0);
+        assert_eq!(memory.memory_read_scale(15_000_000), 0.25);
+        assert_eq!(memory.memory_read_scale(20_000_000), 0.5);
+        assert_eq!(memory.memory_read_scale(30_000_000), 1.0);
+        assert_eq!(memory.memory_read_scale(u64::MAX), 1.0);
+    }
+
+    #[test]
+    fn learned_cq_decay_requires_at_least_two_chunks_of_tbptt() {
+        let mut config = PretrainConfig::from_path("configs/rx6700-v2.json").unwrap();
+        config.memory.chunks_per_detach = 1;
+        config.memory.allow_fixed_decay_with_single_chunk = false;
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.contains("learned CQ decay needs memory.chunks_per_detach >= 2"),
+            "unexpected validation error: {error}"
+        );
+
+        config.memory.allow_fixed_decay_with_single_chunk = true;
+        config.validate().unwrap();
     }
 }
