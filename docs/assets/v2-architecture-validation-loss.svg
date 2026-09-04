@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560" role="img">
+<title>Architecture-v2 pilot: stateful validation loss</title>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:ui-sans-serif,system-ui,sans-serif;fill:#172033}.title{font-size:22px;font-weight:700}.subtitle{font-size:13px;fill:#526071}.tick{font-size:12px;fill:#526071}.legend{font-size:12px}.axis{stroke:#7b8794;stroke-width:1}.grid{stroke:#dce3ea;stroke-width:1}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.point{stroke:#fff;stroke-width:1.5}</style>
+<text class="title" x="88" y="34">Architecture-v2 pilot: stateful validation loss</text>
+<text class="subtitle" x="88" y="57">Same seed, data order, 1,220 updates and 5M-token CQ activation; lower is better</text>
+<line class="grid" x1="88" y1="488.00" x2="932" y2="488.00"/>
+<text class="tick" x="76" y="492.00" text-anchor="end">7.396</text>
+<line class="grid" x1="88" y1="407.60" x2="932" y2="407.60"/>
+<text class="tick" x="76" y="411.60" text-anchor="end">7.655</text>
+<line class="grid" x1="88" y1="327.20" x2="932" y2="327.20"/>
+<text class="tick" x="76" y="331.20" text-anchor="end">7.914</text>
+<line class="grid" x1="88" y1="246.80" x2="932" y2="246.80"/>
+<text class="tick" x="76" y="250.80" text-anchor="end">8.172</text>
+<line class="grid" x1="88" y1="166.40" x2="932" y2="166.40"/>
+<text class="tick" x="76" y="170.40" text-anchor="end">8.431</text>
+<line class="grid" x1="88" y1="86.00" x2="932" y2="86.00"/>
+<text class="tick" x="76" y="90.00" text-anchor="end">8.689</text>
+<line class="grid" x1="88.00" y1="86" x2="88.00" y2="488"/>
+<text class="tick" x="88.00" y="512" text-anchor="middle">6.14</text>
+<line class="grid" x1="228.67" y1="86" x2="228.67" y2="488"/>
+<text class="tick" x="228.67" y="512" text-anchor="middle">8.19</text>
+<line class="grid" x1="369.33" y1="86" x2="369.33" y2="488"/>
+<text class="tick" x="369.33" y="512" text-anchor="middle">10.2</text>
+<line class="grid" x1="510.00" y1="86" x2="510.00" y2="488"/>
+<text class="tick" x="510.00" y="512" text-anchor="middle">12.3</text>
+<line class="grid" x1="650.67" y1="86" x2="650.67" y2="488"/>
+<text class="tick" x="650.67" y="512" text-anchor="middle">14.3</text>
+<line class="grid" x1="791.33" y1="86" x2="791.33" y2="488"/>
+<text class="tick" x="791.33" y="512" text-anchor="middle">16.4</text>
+<line class="grid" x1="932.00" y1="86" x2="932.00" y2="488"/>
+<text class="tick" x="932.00" y="512" text-anchor="middle">18.4</text>
+<line class="axis" x1="88" y1="86" x2="88" y2="488"/>
+<line class="axis" x1="88" y1="488" x2="932" y2="488"/>
+<text class="tick" x="510.00" y="536" text-anchor="middle">training tokens, millions</text>
+<text class="tick" transform="translate(22 287.00) rotate(-90)" text-anchor="middle">stateful cross-entropy loss</text>
+<polyline class="line" stroke="#64748b" points="88.00,113.72 228.67,165.06 369.33,221.33 510.00,287.51 650.67,331.43 791.33,380.26 932.00,409.53"/>
+<circle class="point" cx="88.00" cy="113.72" r="3.5" fill="#64748b"/>
+<circle class="point" cx="228.67" cy="165.06" r="3.5" fill="#64748b"/>
+<circle class="point" cx="369.33" cy="221.33" r="3.5" fill="#64748b"/>
+<circle class="point" cx="510.00" cy="287.51" r="3.5" fill="#64748b"/>
+<circle class="point" cx="650.67" cy="331.43" r="3.5" fill="#64748b"/>
+<circle class="point" cx="791.33" cy="380.26" r="3.5" fill="#64748b"/>
+<circle class="point" cx="932.00" cy="409.53" r="3.5" fill="#64748b"/>
+<polyline class="line" stroke="#2563eb" points="88.00,141.35 228.67,173.04 369.33,243.19 510.00,305.55 650.67,358.13 791.33,389.60 932.00,437.56"/>
+<circle class="point" cx="88.00" cy="141.35" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="228.67" cy="173.04" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="369.33" cy="243.19" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="510.00" cy="305.55" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="650.67" cy="358.13" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="791.33" cy="389.60" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="932.00" cy="437.56" r="3.5" fill="#2563eb"/>
+<polyline class="line" stroke="#16a34a" points="88.00,163.23 228.67,205.54 369.33,265.78 510.00,322.61 650.67,382.90 791.33,415.95 932.00,446.10"/>
+<circle class="point" cx="88.00" cy="163.23" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="228.67" cy="205.54" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="369.33" cy="265.78" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="510.00" cy="322.61" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="650.67" cy="382.90" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="791.33" cy="415.95" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="932.00" cy="446.10" r="3.5" fill="#16a34a"/>
+<polyline class="line" stroke="#dc2626" points="88.00,163.98 228.67,210.82 369.33,264.40 510.00,330.32 650.67,380.46 791.33,416.10 932.00,460.28"/>
+<circle class="point" cx="88.00" cy="163.98" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="228.67" cy="210.82" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="369.33" cy="264.40" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="510.00" cy="330.32" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="650.67" cy="380.46" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="791.33" cy="416.10" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="932.00" cy="460.28" r="3.5" fill="#dc2626"/>
+<polyline class="line" stroke="#9333ea" points="88.00,164.05 228.67,210.86 369.33,264.92 510.00,329.07 650.67,377.97 791.33,420.68 932.00,460.21" stroke-dasharray="8 5"/>
+<circle class="point" cx="88.00" cy="164.05" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="228.67" cy="210.86" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="369.33" cy="264.92" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="510.00" cy="329.07" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="650.67" cy="377.97" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="791.33" cy="420.68" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="932.00" cy="460.21" r="3.5" fill="#9333ea"/>
+<line x1="88" y1="78" x2="108" y2="78" stroke="#64748b" stroke-width="3"/>
+<text class="legend" x="114" y="82">additive</text>
+<line x1="178" y1="78" x2="198" y2="78" stroke="#2563eb" stroke-width="3"/>
+<text class="legend" x="204" y="82">attnres</text>
+<line x1="261" y1="78" x2="281" y2="78" stroke="#16a34a" stroke-width="3"/>
+<text class="legend" x="287" y="82">state</text>
+<line x1="330" y1="78" x2="350" y2="78" stroke="#dc2626" stroke-width="3"/>
+<text class="legend" x="356" y="82">attnres-state</text>
+<line x1="455" y1="78" x2="475" y2="78" stroke="#9333ea" stroke-width="3" stroke-dasharray="6 4"/>
+<text class="legend" x="481" y="82">attnres-state-h1</text>
+<text class="tick" x="932" y="550" text-anchor="end">generated from fixed-budget train.jsonl logs</text>
+</svg>

@@ -808,7 +808,7 @@ mod tests {
         let config = PretrainConfig::from_path("configs/rx6700-v2.json").unwrap();
         assert_eq!(config.format_version, 2);
         assert_eq!(config.total_train_tokens().unwrap(), 1_000_000_000);
-        assert_eq!(config.model.rotary_dim, 64);
+        assert_eq!(config.model.rotary_dim, 384);
         assert!(config.model.tie_embeddings);
         assert!(config.model.attn_residual);
         assert_eq!(config.model.attn_residual_heads, 8);

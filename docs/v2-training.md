@@ -5,9 +5,10 @@ the original run: v1 checkpoints, tokenizer and packed shards are not modified
 or imported because the vocabulary and tensor shapes are incompatible.
 
 The production config is [`configs/rx6700-v2.json`](../configs/rx6700-v2.json).
-It is the current **hypothesis**, not a claim that all new mechanisms help. The
-fixed-budget pilots and the H=1 routing control below are the acceptance gate
-before the long run.
+The fixed-budget architecture and RoPE pilots are complete; their measurements,
+plots, limitations and final selection are recorded in
+[`v2-pilot-results.md`](v2-pilot-results.md). This remains an experimental local
+architecture, not a claim about published BDH-CQ results.
 
 ## 1. Why this is a new model
 
@@ -40,12 +41,12 @@ same block weights.
 
 ### 2.1 RoPE
 
-Production keeps the first 64 coordinates in every 768-wide head under RoPE
-until an isolated sweep provides evidence for changing it. This is a
-hypothesis, not an established optimum. The old implicit rule rotated half of
-each head. Local causal attention still covers the complete 256-token chunk.
-The separate 64/192/384 pilot changes no model dimension, training budget or
-other mechanism; see section 6.
+Production rotates the first 384 coordinates in every 768-wide head. The
+isolated 64/192/384 sweep selected this width: it reached 7.4733 stateful loss
+versus 7.4856 at width 64, with a 1.8% throughput cost and no parameter-count
+change. Local causal attention still covers the complete 256-token chunk; RoPE
+width changes positional capacity, not context length. See section 6 and the
+complete [pilot report](v2-pilot-results.md).
 
 ### 2.2 Full neuron state across recurrent depth
 
@@ -253,7 +254,7 @@ never silently overwritten. Complete shards are validated and reused, so an
 interrupted packing run can be resumed by executing the same command. The
 generated manifest records `ficbook_metadata_included: false`.
 
-## 6. Hardware width check, architecture pilots and isolated RoPE sweep
+## 6. Hardware width check and completed pilot experiments
 
 First compare `H*Q` 4096, 5120 and 6144 on one complete stateful work block:
 
@@ -284,12 +285,12 @@ older pilot directories are deliberately preserved but must not be compared:
 they used both the previous cumulative-state semantics and, for the oldest
 runs, eight-chunk graphs that spilled into GTT.
 
-The final report uses stateful held-out loss, per-source BPB, finite-state
-checks and median throughput. A difference below roughly 1% is weak evidence;
-prefer the faster/simpler variant in that case. First select the winning
-`attn_residual`/`gated_neuron_state` combination, then require H=8 to beat its
-H=1 control before retaining eight routing heads. Copy those settings into the
-production config before its run directory exists.
+The completed architecture table selected the combined `attnres-state` model:
+7.4856 stateful loss versus 7.6488 for the additive control, corresponding to
+about 15.1% lower perplexity. H=8 and H=1 routing were effectively tied; H=8 is
+retained because it has the same parameter count, negligible extra cost and
+preserves per-subspace depth routing. Exact tables and curves are in the
+[pilot report](v2-pilot-results.md).
 
 After selecting the combined architecture, compare positional width alone:
 
@@ -302,8 +303,9 @@ The three configs `rx6700-v2-rope-{64,192,384}.json` are identical except for
 (19,988,480-token) budget and accelerated 5M-token CQ activation as the main
 pilots. Do not pool these runs into the A–E architecture table: the first table
 selects state/routing mechanisms, while this second experiment selects only
-RoPE width. Production intentionally remains at 64 until this comparison is
-complete.
+RoPE width. The completed sweep selected 384/768 after it beat width 64 at
+every stateful validation checkpoint. The production config now carries that
+decision.
 
 ## 7. Production and monitoring
 

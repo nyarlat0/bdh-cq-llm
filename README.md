@@ -108,20 +108,22 @@ resumes its latest checkpoint, and follows the 750M general + 250M Ficbook-focus
 curriculum. Read [`docs/pretraining.md`](docs/pretraining.md) before starting a
 multi-day run.
 
-The new architecture-v2 run is intentionally separate. Prepare its body-only
-24,576-token ABI, benchmark the three body widths, then run the four
-architecture pilots plus the H=1 routing control before starting production:
+The new architecture-v2 run is intentionally separate. Its fixed-budget
+architecture and RoPE pilots are complete: wide delta-state plus eight-head
+MHAR won the architecture comparison, and 384/768 won the positional-width
+sweep. The measured tables and curves are in
+[`docs/v2-pilot-results.md`](docs/v2-pilot-results.md). Prepare its body-only
+24,576-token ABI, then start production with the frozen config:
 
 ```console
 ./scripts/prepare_v2_data.sh
-python3 scripts/benchmark_v2_widths.py 0
-scripts/run_v2_pilots.sh 0
 cargo run --release --bin train_llm -- --config configs/rx6700-v2.json
 ```
 
 These commands do not add chat-role labels or content filters. See
-[`docs/v2-training.md`](docs/v2-training.md) for the exact acceptance criteria
-and why the production command must be run only after choosing the pilot winner.
+[`docs/v2-training.md`](docs/v2-training.md) for the exact schedule and
+monitoring protocol. The benchmark and pilot launchers remain available for
+reproduction, but their old run directories must not be mixed with production.
 
 The training examples are mechanics demonstrations, not reproductions of paper
 results. `train_tiny_icq` covers the latent-reasoning objective behind the

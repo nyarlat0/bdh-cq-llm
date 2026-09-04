@@ -818,7 +818,7 @@ fn production_v2_parameter_growth_is_only_per_neuron_linear_storage() {
         .with_depth(8)
         .with_heads(8)
         .with_dim_qk_heads(6_144)
-        .with_rotary_dim(64)
+        .with_rotary_dim(384)
         .with_tie_embeddings(true)
         .with_attn_residual(true)
         .with_attn_residual_tied(true)

@@ -8,8 +8,8 @@
   "block_sequences": 256,
   "sources": {
     "fineweb2_hq": { "train_tokens": 650000000, "validation_tokens": 1000000 },
-    "ficbook":     { "train_tokens": 300000000, "validation_tokens": 1000000 },
-    "ru_classic":  { "train_tokens":  50000000, "validation_tokens": 1000000 }
+    "ficbook": { "train_tokens": 300000000, "validation_tokens": 1000000 },
+    "ru_classic": { "train_tokens": 50000000, "validation_tokens": 1000000 }
   },
   "ficbook_phase_one_tokens": 50000000,
   "focus_replay": {
@@ -21,7 +21,7 @@
     "depth": 8,
     "heads": 8,
     "dim_qk_heads": 6144,
-    "rotary_dim": 64,
+    "rotary_dim": 384,
     "tie_embeddings": true,
     "attn_residual": true,
     "attn_residual_tied": true,

@@ -98,10 +98,11 @@ makes this large feature space non-negative. The unrotated `G` is kept for the
 gate because rotation introduces signed components.
 
 The upstream-compatible default rotates the first half of each head. An
-explicit `rotary_dim` may select a narrower even prefix (v2 uses 64 of 768
-features); the remainder stays semantic and non-negative. RoPE consumes one
-position id per batch row and token rather than assuming all rows share a
-cursor.
+explicit `rotary_dim` may select a different even prefix; production v2 uses
+384 of 768 features after the fixed-budget RoPE sweep selected the half-head
+setting over 64 and 192. The remainder stays semantic and non-negative. RoPE
+consumes one position id per batch row and token rather than assuming all rows
+share a cursor. See the [pilot report](v2-pilot-results.md) for measurements.
 
 ### 4.2 Read current and past context
 
