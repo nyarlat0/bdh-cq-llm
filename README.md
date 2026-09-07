@@ -6,6 +6,8 @@ tensor-level model, recurrent fast-weight memory, continuous latent-reasoning
 wrapper, ARC-style task generators and codec, generation, training losses,
 tests, and small runnable examples.
 
+For single-GPU NVIDIA training, see [Tesla V100 CUDA setup and short benchmark](docs/v100.md).
+
 The most important scope note is that this is a port of the **public
 reconstruction**, not Pathway's evaluated proprietary model. The
 [BDH-CQ paper](https://arxiv.org/abs/2608.09888) gives the system-level
@@ -124,6 +126,15 @@ The production config writes to `runs/rx6700-v2-cq-ramp`; it deliberately does
 not resume or import the discarded `runs/rx6700-v2` experiment. CQ starts
 after the 10M-token LR warm-up, its read is ramped to full strength over 20M
 tokens, and exact learned decay uses two-chunk TBPTT.
+
+After changing trainer code, stop production at a safe checkpoint before
+running `python3 scripts/benchmark_v2_memory_path.py --device 0`. The benchmark
+uses temporary continuation runs and, only if the normal `4×16` physical batch
+still spills into GTT, compares the checkpoint-compatible `2×32` fallback.
+On the tested RX 6700, the post-fix comparison selected `2×32`: it measured
+2,255 tok/s with 5,188 MiB peak VRAM and 6 MiB peak GTT. The exact one-time
+continuation command is documented in
+[`docs/v2-training.md`](docs/v2-training.md#7-production-and-monitoring).
 
 These commands do not add chat-role labels or content filters. See
 [`docs/v2-training.md`](docs/v2-training.md) for the exact schedule and

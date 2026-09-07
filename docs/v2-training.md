@@ -173,13 +173,15 @@ There are three distinct horizons:
 |---|---:|---|
 | exact local causal attention | 256 tokens | no |
 | gradient horizon through CQ (truncated BPTT) | 2 chunks = 512 tokens | gradients only |
-| CQ value lifetime | until `<|doc|>` or work-block reset | yes, detached every chunk |
+| CQ value lifetime | until `<|doc|>` or work-block reset | yes, graph detached every 2 chunks |
 
-Four stable lanes are trained concurrently in one physical `[4,256]` forward.
-Every lane receives consecutive chunks from its own stripe. `Memory` stores a
-batch of four independent CQ rows and four independent RoPE offsets. A
-256-sequence work block gives each lane up to 64 adjacent chunks, or 16,384
-tokens, before the mandatory shuffle-boundary reset.
+The primary physical batch uses four stable lanes in one `[4,256]` forward.
+Every lane receives consecutive chunks from its own stripe. `Memory` stores
+four independent CQ rows and four independent RoPE offsets. A 256-sequence
+work block therefore gives each lane up to 64 adjacent chunks, or 16,384
+tokens, before the mandatory shuffle-boundary reset. The memory-pressure
+fallback uses two lanes of 128 chunks; it keeps the same 64 sequences and
+16,384 tokens per optimizer update by changing accumulation from 16 to 32.
 
 If `<|doc|>` appears at different positions in different lanes, row-major
 document-start flags produce per-token positions and three masks: local
@@ -201,12 +203,23 @@ only the gradient graph is bounded. Production therefore executes
 `chunk t -> chunk t+1 -> Memory.detach()`, giving `raw_rho` a real downstream
 loss without returning to the spilling eight-chunk graph.
 
-A four-update production-width smoke with `rotary_dim=384` measured a steady
-approximately 2.54K tok/s, 9,881 MiB peak requested/resident VRAM and 6 MiB
-GTT on the tested card. This confirms that the complete two-chunk graph fits
-without system-memory spill. It also supersedes the faster one-chunk pilot
-throughput for wall-clock planning: the full 1.05B-token schedule is roughly
-115 hours (about 4.8 days) if that short-smoke rate is sustained.
+A four-update production-width smoke initially measured approximately 2.54K
+tok/s, but it was too short to expose the allocator's sustained high-water
+behavior. The real run measured about 3.51K tok/s while memoryless and 1.68K
+tok/s after stateful TBPTT2 activation. Stateful interval peaks reached about
+10.5 GiB resident VRAM plus as much as 2.6 GiB GTT. GPU utilization remained
+99% at normal clocks and temperatures, so this was not CPU starvation or
+thermal throttling.
+
+The hot path previously materialized `H` identical copies of `[B,N,D]` values
+and `B` identical copies of the shared `[H,D,Q]` projection at every one of the
+eight recurrent depths. TBPTT2 retained both sets. The implementation now
+folds batch/head into ordinary grouped GEMM row axes and builds the chunk's
+RoPE trigonometric factors once for all recurrent depths. It deliberately does
+not depend on leading-dimension broadcast: Burn/WGPU 0.21 supports that
+forward but its autodiff path fails for the production projection shape.
+Grouped GEMM preserves forward values and summed parameter gradients; unit
+tests compare it against the old explicit-repeat computation.
 
 Burn/CubeCL's default sliced allocator also keeps completely free pages at its
 peak high-water mark unless an explicit cleanup is requested. The trainer now
@@ -246,7 +259,10 @@ phase two deliberately replays 50M general-domain tokens:
 
 After whole-sequence and optimizer-boundary trimming, the deterministic
 schedule is 1,049,985,024 target tokens and 64,086 optimizer updates. One
-update contains `4 lanes × 16 microbatches × 256 = 16,384` target tokens.
+update contains either `4 × 16 × 256` or `2 × 32 × 256` = 16,384 target
+tokens. The latter changes only physical partitioning and is allowed when
+importing a safe work-block-boundary checkpoint; all AdamW and LR settings
+must remain identical.
 
 CQ is memoryless during the 10M-token LR warm-up. At that optimizer-step
 boundary it starts carrying CQ values, while the previous-memory read uses
@@ -346,11 +362,69 @@ decision.
 
 ## 7. Production and monitoring
 
+Before resuming after a trainer rebuild, benchmark the optimized stateful path
+from the latest safe checkpoint:
+
+```console
+python3 scripts/benchmark_v2_memory_path.py --device 0
+```
+
+The script refuses to run while another `train_llm` process is active or the
+discrete GPU already has more than 1,536 MiB VRAM allocated / more than 20%
+reported utilization. This prevents games and other GUI workloads from
+silently contaminating the comparison; `--allow-busy-gpu` exists only for an
+explicitly non-comparable diagnostic. The script imports the checkpoint into
+temporary directories, runs 16 optimizer updates, and never changes the
+production latest pointer. It measures `4×16` first. If peak GTT exceeds 512
+MiB, it also measures the equal-effective-batch `2×32` fallback and selects
+the fastest finite result below that threshold. It prints the exact
+resume/import command for the selected partition.
+
+The post-optimization measurement from production checkpoint `step-4956`
+(81,199,104 tokens) was:
+
+| physical batch | median tok/s | peak VRAM | peak GTT | result |
+|---|---:|---:|---:|---|
+| `4×16` | 2,246 | 10,309 MiB | 774 MiB | rejected for spill/variance |
+| `2×32` | 2,255 | 5,188 MiB | 6 MiB | selected |
+
+Both rows retain exact two-chunk TBPTT and 16,384 target tokens per AdamW
+update. `2×32` does change the physical lane partition: two longer CQ stripes
+replace four shorter stripes inside each 256-sequence work block. It is
+therefore checkpoint-compatible at a block boundary and preserves optimizer
+scaling, but is not claimed to be bitwise-identical sample ordering. The
+longer CQ lifetime is consistent with the recurrent-memory objective. Against
+the observed pre-fix stateful rate of about 1.68K tok/s, the selected path is
+about 34% faster and removes sustained system-memory spill. It remains slower
+than the 3.51K memoryless path because CQ reads/writes and the second retained
+chunk are real additional forward/backward work.
+
+The fallback pins `schedule_batch_multiple=4`. This affects only source-tail
+rounding: despite its physical batch of two, it reconstructs the exact same
+shuffled block list, block sizes, token offsets and phase boundary as the
+already-started B4 run. The trainer verifies this compatibility before import;
+the switch is permitted only when `sequence_in_block == 0`.
+
 After the width and pilot decisions:
 
 ```console
 cargo run --release --bin train_llm -- --config configs/rx6700-v2.json
 ```
+
+If the benchmark selects `2×32`, import the stopped run's latest checkpoint
+once into the isolated fallback run:
+
+```console
+cargo run --release --bin train_llm -- \
+  --config configs/rx6700-v2-tbptt2-mb2.json \
+  --import-checkpoint runs/rx6700-v2-cq-ramp/checkpoints/step-N
+```
+
+Replace `step-N` with the directory named by the old run's `latest.json`.
+Subsequent resumes use the fallback config without `--import-checkpoint`.
+Changing physical batch is rejected unless the source checkpoint is at a
+work-block boundary, and it does not reset weights, Adam moments, token cursor
+or the learning-rate schedule.
 
 Validation events are appended to `runs/rx6700-v2-cq-ramp/train.jsonl`. They contain
 memoryless and stateful loss, perplexity and decoded UTF-8 bits/byte separately
@@ -371,3 +445,10 @@ requests the same behavior. Remove `STOP` before resuming. Do not use SIGKILL
 when a resumable checkpoint is required.
 
 No script in this change starts the production run automatically.
+
+## Tesla V100 execution path
+
+For a fresh run on one V100 32GB see [V100 setup and benchmark](v100.md).
+CUDA FP32 and opt-in FP16-input/FP32-output projections preserve the v2 model;
+the latter still uses FP32 backward and is not full AMP. Neither target GPU
+performance nor mixed-precision convergence has been established locally.

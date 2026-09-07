@@ -7,22 +7,36 @@
 
 use burn::tensor::{Tensor, backend::Backend};
 
-/// Apply RoPE to `[batch, heads, sequence, qk_per_head]`.
-pub(crate) fn apply_rotary<B: Backend>(
-    input: Tensor<B, 4>,
-    position_ids: &[usize],
+/// Trigonometric factors shared by every recurrent use of one token chunk.
+///
+/// Recurrent BDH depth changes the query values but not their positions.  The
+/// old implementation rebuilt the same host phase vector and launched the
+/// same `cos`/`sin` kernels once per depth.  Keeping these non-trainable
+/// tensors beside the chunk metadata makes the reuse explicit without adding
+/// a persistent or position-limited model cache.
+pub(crate) struct RotaryPhases<B: Backend> {
+    cos: Tensor<B, 4>,
+    sin: Tensor<B, 4>,
+    batch: usize,
+    sequence: usize,
     rotary_dim: usize,
-) -> Tensor<B, 4> {
-    let [batch, heads, sequence, qk_dim] = input.dims();
+}
+
+/// Build the RoPE factors for one `[batch, sequence]` position grid.
+pub(crate) fn rotary_phases<B: Backend>(
+    position_ids: &[usize],
+    batch: usize,
+    sequence: usize,
+    rotary_dim: usize,
+    device: &B::Device,
+) -> RotaryPhases<B> {
     assert_eq!(
         position_ids.len(),
         batch * sequence,
         "RoPE needs one explicit position id per batch/sequence element"
     );
-    debug_assert!(rotary_dim <= qk_dim);
     debug_assert_eq!(rotary_dim % 2, 0);
 
-    let device = input.device();
     let pairs = rotary_dim / 2;
 
     // rotary-embedding-torch uses
@@ -38,10 +52,31 @@ pub(crate) fn apply_rotary<B: Backend>(
         }
     }
 
-    let phase = Tensor::<B, 1>::from_floats(phases.as_slice(), &device)
+    let phase = Tensor::<B, 1>::from_floats(phases.as_slice(), device)
         .reshape([batch, 1, sequence, rotary_dim]);
-    let cos = phase.clone().cos();
-    let sin = phase.sin();
+    RotaryPhases {
+        cos: phase.clone().cos(),
+        sin: phase.sin(),
+        batch,
+        sequence,
+        rotary_dim,
+    }
+}
+
+/// Apply precomputed RoPE to `[batch, heads, sequence, qk_per_head]`.
+pub(crate) fn apply_rotary<B: Backend>(
+    input: Tensor<B, 4>,
+    phases: &RotaryPhases<B>,
+) -> Tensor<B, 4> {
+    let [batch, heads, sequence, qk_dim] = input.dims();
+    assert_eq!(batch, phases.batch, "RoPE cache batch does not match input");
+    assert_eq!(
+        sequence, phases.sequence,
+        "RoPE cache sequence does not match input"
+    );
+    let rotary_dim = phases.rotary_dim;
+    debug_assert!(rotary_dim <= qk_dim);
+    let pairs = rotary_dim / 2;
 
     let middle = input
         .clone()
@@ -56,7 +91,7 @@ pub(crate) fn apply_rotary<B: Backend>(
         .squeeze_dim::<4>(4);
     let rotated_half =
         Tensor::stack::<5>(vec![-second, first], 4).reshape([batch, heads, sequence, rotary_dim]);
-    let transformed = middle * cos + rotated_half * sin;
+    let transformed = middle * phases.cos.clone() + rotated_half * phases.sin.clone();
 
     if rotary_dim == qk_dim {
         transformed
@@ -74,6 +109,22 @@ mod tests {
 
     type TestBackend = NdArray<f32>;
 
+    fn apply(
+        input: Tensor<TestBackend, 4>,
+        position_ids: &[usize],
+        rotary_dim: usize,
+    ) -> Tensor<TestBackend, 4> {
+        let [batch, _, sequence, _] = input.dims();
+        let phases = rotary_phases::<TestBackend>(
+            position_ids,
+            batch,
+            sequence,
+            rotary_dim,
+            &input.device(),
+        );
+        apply_rotary(input, &phases)
+    }
+
     #[test]
     fn position_zero_is_the_identity() {
         let device = Default::default();
@@ -82,7 +133,7 @@ mod tests {
             &device,
         );
         assert_eq!(
-            apply_rotary(input.clone(), &[0], 4)
+            apply(input.clone(), &[0], 4)
                 .into_data()
                 .to_vec::<f32>()
                 .unwrap(),
@@ -97,7 +148,7 @@ mod tests {
             TensorData::new((0..16).map(|value| value as f32).collect(), [1, 1, 2, 8]),
             &device,
         );
-        let rotated = apply_rotary(input.clone(), &[5, 6], 4);
+        let rotated = apply(input.clone(), &[5, 6], 4);
         assert_eq!(
             rotated
                 .slice([0..1, 0..1, 0..2, 4..8])
@@ -119,21 +170,46 @@ mod tests {
             TensorData::new((0..16).map(|value| value as f32).collect(), [1, 1, 2, 8]),
             &device,
         );
-        let batched = apply_rotary(
+        let batched = apply(
             Tensor::cat(vec![row.clone(), row.clone()], 0),
             &[3, 4, 11, 12],
             4,
         );
         let separate = Tensor::cat(
-            vec![
-                apply_rotary(row.clone(), &[3, 4], 4),
-                apply_rotary(row, &[11, 12], 4),
-            ],
+            vec![apply(row.clone(), &[3, 4], 4), apply(row, &[11, 12], 4)],
             0,
         );
         assert_eq!(
             batched.into_data().to_vec::<f32>().unwrap(),
             separate.into_data().to_vec::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn one_phase_cache_can_be_reused_across_recurrent_depths() {
+        let device = Default::default();
+        let first = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                (0..32).map(|value| value as f32 / 7.0).collect(),
+                [2, 1, 2, 8],
+            ),
+            &device,
+        );
+        let second = first.clone() * 0.5;
+        let phases = rotary_phases::<TestBackend>(&[3, 4, 11, 12], 2, 2, 4, &device);
+
+        let cached_first = apply_rotary(first.clone(), &phases);
+        let cached_second = apply_rotary(second.clone(), &phases);
+        let fresh_first = apply(first, &[3, 4, 11, 12], 4);
+        let fresh_second = apply(second, &[3, 4, 11, 12], 4);
+
+        assert_eq!(
+            cached_first.into_data().to_vec::<f32>().unwrap(),
+            fresh_first.into_data().to_vec::<f32>().unwrap()
+        );
+        assert_eq!(
+            cached_second.into_data().to_vec::<f32>().unwrap(),
+            fresh_second.into_data().to_vec::<f32>().unwrap()
         );
     }
 }

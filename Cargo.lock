@@ -242,6 +242,8 @@ name = "bdh-cq-llm"
 version = "0.1.0"
 dependencies = [
  "burn",
+ "burn-autodiff",
+ "burn-cubecl",
  "rand 0.10.2",
  "serde",
  "serde_json",

@@ -24,6 +24,7 @@ use rand::RngExt;
 use crate::{
     error::BdhError,
     model::{Bdh, BdhForwardOptions, LatentWorkspace, Memory, ModelInput},
+    precision::ProjectionBackend,
 };
 
 /// One segment in an interleaved reasoning program.
@@ -73,7 +74,11 @@ impl ReasoningWrapperConfig {
     }
 
     /// Wrap an initialized BDH model.
-    pub fn init<B: Backend>(self, bdh: Bdh<B>, device: &B::Device) -> ReasoningWrapper<B> {
+    pub fn init<B: ProjectionBackend>(
+        self,
+        bdh: Bdh<B>,
+        device: &B::Device,
+    ) -> ReasoningWrapper<B> {
         ReasoningWrapper {
             latent_step_embedding: self
                 .latent_step_embedding
@@ -163,7 +168,7 @@ pub struct ReasoningWrapper<B: Backend> {
     ignore_token: Option<usize>,
 }
 
-impl<B: Backend> ReasoningWrapper<B> {
+impl<B: ProjectionBackend> ReasoningWrapper<B> {
     /// Access the underlying shared-depth model.
     pub fn model(&self) -> &Bdh<B> {
         &self.bdh

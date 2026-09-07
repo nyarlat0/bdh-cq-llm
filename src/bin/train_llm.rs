@@ -14,7 +14,7 @@ use bdh_cq_llm::{
     },
 };
 use burn::{
-    backend::{Autodiff, Vulkan, wgpu::WgpuDevice},
+    backend::Autodiff,
     grad_clipping::GradientClippingConfig,
     module::{AutodiffModule, Module},
     nn::loss::CrossEntropyLossConfig,
@@ -39,7 +39,14 @@ use std::{
 };
 use tokenizers::Tokenizer;
 
-type InferenceBackend = Vulkan<f32, i32>;
+#[cfg(not(feature = "cuda"))]
+type InferenceBackend = burn::backend::Vulkan<f32, i32>;
+#[cfg(feature = "cuda")]
+type InferenceBackend = burn::backend::Cuda<f32, i32>;
+#[cfg(not(feature = "cuda"))]
+type TrainingDevice = burn::backend::wgpu::WgpuDevice;
+#[cfg(feature = "cuda")]
+type TrainingDevice = burn::backend::cuda::CudaDevice;
 type TrainingBackend = Autodiff<InferenceBackend>;
 type CheckpointRecorder = BinFileRecorder<FullPrecisionSettings>;
 type AnyError = Box<dyn std::error::Error>;
@@ -346,15 +353,32 @@ fn main() -> Result<(), AnyError> {
         .ok_or("tokenizer has no <|pad|> token")? as i64;
 
     fs::create_dir_all(&config.run_dir)?;
+    freeze_execution_mode(&config.run_dir)?;
     freeze_config(&config.run_dir, &arguments.config_path, &config_sha256)?;
     let schedule = TrainingSchedule::build(&config)?;
     let mut loader = TokenLoader::open(&config, schedule, vocabulary, tokenizer_sha256_bytes)?;
 
-    let device = WgpuDevice::DiscreteGpu(arguments.device_index);
+    #[cfg(not(feature = "cuda"))]
+    let device = TrainingDevice::DiscreteGpu(arguments.device_index);
+    #[cfg(feature = "cuda")]
+    let device = burn::backend::cuda::CudaDevice::new(arguments.device_index);
     TrainingBackend::seed(&device, config.seed);
     println!(
-        "initializing Vulkan device {:?}; vocab={}, local context={}, schedule={} tokens",
+        "initializing GPU device {:?}; vocab={}, local context={}, schedule={} tokens",
         device, vocabulary, config.sequence_length, loader.schedule.effective_tokens
+    );
+    println!(
+        "backend={}, precision={}",
+        if cfg!(feature = "cuda") {
+            "CUDA (no Fusion)"
+        } else {
+            "Vulkan (no Fusion)"
+        },
+        if cfg!(feature = "cuda-fp16") {
+            "FP16 projection inputs; FP32 outputs/backward/state (experimental)"
+        } else {
+            "FP32"
+        }
     );
     let mut model = BdhConfig::new(vocabulary, config.model.dim)
         .with_depth(config.model.depth)
@@ -389,7 +413,12 @@ fn main() -> Result<(), AnyError> {
         config.sequence_length,
     );
     println!(
-        "GPU allocator: explicit CubeCL cleanup after every optimizer update; loss readback once/update"
+        "GPU allocator: {}; loss readback once/update",
+        if cfg!(feature = "cuda") {
+            "reuse CUDA buffers between updates"
+        } else {
+            "explicit CubeCL cleanup after every optimizer update"
+        }
     );
     if config.memory.stateful_after_tokens == u64::MAX {
         println!("CQ curriculum: persistent memory is disabled");
@@ -469,6 +498,8 @@ fn main() -> Result<(), AnyError> {
         );
     }
 
+    validate_v2_parameter_shapes(&model, &config)?;
+
     if config.memory.is_stateful(state.tokens_seen) && state.cq_activation_tokens.is_none() {
         state.cq_activation_tokens = Some(state.tokens_seen);
         println!(
@@ -498,6 +529,46 @@ fn main() -> Result<(), AnyError> {
         &device,
         arguments.max_steps,
     )
+}
+
+fn validate_v2_parameter_shapes(
+    model: &Bdh<TrainingBackend>,
+    config: &PretrainConfig,
+) -> Result<(), AnyError> {
+    let expected = [
+        config.model.heads,
+        config.model.dim_qk_heads / config.model.heads,
+    ];
+    for (name, actual) in [
+        (
+            "raw_rho",
+            model
+                .cq_retention_probabilities()
+                .map(|tensor| tensor.dims()),
+        ),
+        (
+            "raw_state_update",
+            model
+                .base_state_update_probabilities()
+                .map(|tensor| tensor.dims()),
+        ),
+        (
+            "raw_state_injection",
+            model
+                .state_injection_strengths()
+                .map(|tensor| tensor.dims()),
+        ),
+    ] {
+        if let Some(actual) = actual
+            && actual != expected
+        {
+            return Err(format!(
+                "loaded {name} has shape {actual:?}, expected per-neuron [H,Q] {expected:?}; checkpoint/model record schemas are incompatible"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Fail before hashing or GPU initialization with an actionable inventory of
@@ -544,7 +615,7 @@ fn train<O>(
     document_token: i64,
     padding_token: i64,
     tokenizer: &Tokenizer,
-    device: &WgpuDevice,
+    device: &TrainingDevice,
     max_steps: Option<u64>,
 ) -> Result<(), AnyError>
 where
@@ -697,6 +768,9 @@ where
         // The default sliced allocator otherwise retains its peak allocation
         // forever, which previously left ~15 GiB resident in amdgpu GTT after
         // an eight-chunk graph had already been freed.
+        // CUDA retains reusable buffers between updates. The AMD workaround
+        // above must not force cudaFree/reallocation on every training step.
+        #[cfg(not(feature = "cuda"))]
         TrainingBackend::memory_cleanup(device);
         state.optimizer_step += 1;
         state.block_index = loader.block_index;
@@ -934,7 +1008,7 @@ fn memoryless_chunk_loss(
     criterion: &burn::nn::loss::CrossEntropyLoss<TrainingBackend>,
     batch: &TokenBatch,
     vocabulary: usize,
-    device: &WgpuDevice,
+    device: &TrainingDevice,
 ) -> Result<Tensor<TrainingBackend, 1>, AnyError> {
     let sequence = batch.inputs.len() / batch.batch_size;
     let inputs =
@@ -961,7 +1035,7 @@ fn stateful_chunk_loss(
     document_resets: &mut u64,
     memory_read_scale: f64,
     vocabulary: usize,
-    device: &WgpuDevice,
+    device: &TrainingDevice,
 ) -> Result<Tensor<TrainingBackend, 1>, AnyError> {
     let sequence = batch.inputs.len() / batch.batch_size;
     let mut document_starts = reset_on_document.then(|| {
@@ -1349,7 +1423,7 @@ fn validate(
     document_token: i64,
     padding_token: i64,
     tokenizer: &Tokenizer,
-    device: &WgpuDevice,
+    device: &TrainingDevice,
     stateful: bool,
     memory_read_scale: f64,
 ) -> Result<ValidationMetrics, AnyError> {
@@ -1489,7 +1563,7 @@ fn inference_chunk_loss(
     valid_sequence_length: Option<usize>,
     memory_read_scale: f64,
     vocabulary: usize,
-    device: &WgpuDevice,
+    device: &TrainingDevice,
 ) -> Result<(f32, Option<Memory<InferenceBackend>>), AnyError> {
     let sequence = batch.inputs.len() / batch.batch_size;
     let inputs =
@@ -1580,7 +1654,7 @@ fn learning_rate(
 
 fn load_checkpoint<O>(
     checkpoint: &Path,
-    device: &WgpuDevice,
+    device: &TrainingDevice,
     model: Bdh<TrainingBackend>,
     optimizer: O,
 ) -> Result<(Bdh<TrainingBackend>, O), AnyError>
@@ -1625,7 +1699,15 @@ fn import_state(
     }
     let previous = PretrainConfig::from_path(previous_config_path)?;
     if !config.continuation_compatible_with(&previous) {
-        return Err("new config changes more than run_dir/memory policy; refusing import".into());
+        return Err(
+            "new config changes model/data/effective-batch/optimizer semantics; refusing import"
+                .into(),
+        );
+    }
+    if config.optimizer.micro_batch_size != previous.optimizer.micro_batch_size
+        && state.sequence_in_block != 0
+    {
+        return Err("micro_batch_size may change only at a work-block-boundary checkpoint".into());
     }
     state.format_version = if config.format_version >= 2 { 3 } else { 2 };
     state.config_sha256 = config_sha256.to_owned();
@@ -1735,6 +1817,31 @@ fn freeze_config(run_dir: &Path, source: &Path, expected_sha256: &str) -> Result
         }
     } else {
         fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
+/// A compile-time precision switch must not silently change a resumed run.
+/// Legacy unmarked Vulkan runs remain usable; CUDA starts a new run or imports
+/// deliberately into an empty one. This file does not alter checkpoint records.
+fn freeze_execution_mode(run_dir: &Path) -> Result<(), AnyError> {
+    let mode = if cfg!(feature = "cuda-fp16") {
+        "cuda-fp16-projections-fp32-backward-v1\n"
+    } else if cfg!(feature = "cuda") {
+        "cuda-fp32-v1\n"
+    } else {
+        "vulkan-fp32-v1\n"
+    };
+    let path = run_dir.join("execution-mode.txt");
+    if path.exists() {
+        if fs::read_to_string(&path)? != mode {
+            return Err("run backend/precision differs: use a separate run_dir".into());
+        }
+    } else {
+        if cfg!(feature = "cuda") && run_dir.join("checkpoints/latest.json").exists() {
+            return Err("unmarked existing run: use a new CUDA run_dir".into());
+        }
+        fs::write(path, mode)?;
     }
     Ok(())
 }

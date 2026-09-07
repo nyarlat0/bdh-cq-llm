@@ -13,7 +13,11 @@ use burn::{
     tensor::{Int, Tensor, activation, backend::Backend},
 };
 
-use crate::{error::BdhError, rope::apply_rotary};
+use crate::{
+    error::BdhError,
+    precision::{ProjectionBackend, linear, projection_matmul},
+    rope::{RotaryPhases, apply_rotary, rotary_phases},
+};
 
 /// A single layer's associative fast-weight matrix.
 ///
@@ -297,7 +301,7 @@ pub struct BdhConfig {
 
 impl BdhConfig {
     /// Validate dimensions and initialize a model on `device`.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Result<Bdh<B>, BdhError> {
+    pub fn init<B: ProjectionBackend>(&self, device: &B::Device) -> Result<Bdh<B>, BdhError> {
         self.validate()?;
 
         let qk_per_head = self.dim_qk_heads / self.heads;
@@ -443,10 +447,12 @@ struct BdhBlock<B: Backend> {
     raw_state_injection: Option<Param<Tensor<B, 2>>>,
     heads: usize,
     qk_per_head: usize,
+    // Kept in the derived Module record for checkpoint-schema compatibility.
+    // RoPE phases are now built by Bdh once per recurrent loop.
     rotary_dim: usize,
 }
 
-impl<B: Backend> BdhBlock<B> {
+impl<B: ProjectionBackend> BdhBlock<B> {
     fn new(
         dim: usize,
         heads: usize,
@@ -498,6 +504,7 @@ impl<B: Backend> BdhBlock<B> {
         previous_memory: Option<&Tensor<B, 4>>,
         neuron_state: Option<Tensor<B, 4>>,
         metadata: &SequenceMetadata<B>,
+        rotary: &RotaryPhases<B>,
         memory_read_scale: f64,
     ) -> BdhBlockOutput<B> {
         let [batch, sequence, dim] = tokens.dims();
@@ -506,9 +513,7 @@ impl<B: Backend> BdhBlock<B> {
         // available it is injected into the raw projection before the single
         // ReLU, exactly as G = ReLU(W_qk X + alpha * RMS(S_prev)).  The
         // state-free/legacy path therefore remains G = ReLU(W_qk X).
-        let projected = self
-            .to_qk
-            .forward(tokens.clone())
+        let projected = linear(tokens.clone(), self.to_qk.weight.val())
             .reshape([batch, sequence, self.heads, self.qk_per_head])
             .permute([0, 2, 1, 3]);
         let gates = if let (Some(state), Some(raw_injection)) =
@@ -526,7 +531,7 @@ impl<B: Backend> BdhBlock<B> {
         };
 
         // The gate remains unrotated.  Only Q and K receive positional phase.
-        let q = apply_rotary(gates.clone(), &metadata.position_ids, self.rotary_dim);
+        let q = apply_rotary(gates.clone(), rotary);
         // This reconstruction deliberately shares the same projection for Q
         // and K, so their rotated tensors are identical. Reusing the result
         // avoids a second host phase build and pair of trigonometric kernels.
@@ -539,11 +544,10 @@ impl<B: Backend> BdhBlock<B> {
         if let Some(mask) = &metadata.local_attention_mask {
             similarity = similarity * mask.clone();
         }
-        let values_by_head = tokens
-            .clone()
-            .unsqueeze_dim::<4>(1)
-            .repeat_dim(1, self.heads);
-        let mut aggregate = similarity.matmul(values_by_head.clone());
+        // Treat H as an additional row group instead of materializing H copies
+        // of V. This is an ordinary rank-3 batched GEMM with no broadcasting,
+        // which is supported by both Burn/WGPU forward and autodiff backward.
+        let mut aggregate = grouped_head_value_read(similarity, tokens.clone());
 
         // Previous chunks are compressed into M = sum(K^T V).  Retrieval
         // qM is algebraically the same contraction as attention over every
@@ -558,15 +562,10 @@ impl<B: Backend> BdhBlock<B> {
 
         let attention_out = layer_norm_no_params(aggregate);
 
-        // [B,H,N,D] @ [B,H,D,Q] -> [B,H,N,Q].  Multiplication by the original
-        // sparse Q/K features is the BDH multiplicative gate.  Since gates are
-        // nonnegative, relu(projected * gates) equals gates * relu(projected).
-        let projection = self
-            .proj_up
-            .val()
-            .unsqueeze_dim::<4>(0)
-            .repeat_dim(0, batch);
-        let lifted = activation::relu(attention_out.matmul(projection) * gates);
+        // Move B*N into the matrix-row axis so the [H,D,Q] parameter remains
+        // shared without a physical [B,H,D,Q] copy or broadcasted backward.
+        let lifted =
+            activation::relu(grouped_head_projection(attention_out, self.proj_up.val()) * gates);
 
         // The persistent wide state and the information communicated through
         // narrow D are distinct. With no previous state the first candidate
@@ -609,11 +608,11 @@ impl<B: Backend> BdhBlock<B> {
         // already zeroed before the shared recurrent block and contributes no
         // write because every projection on this path is bias-free.
         let values_for_memory = if let Some(mask) = &metadata.memory_write_mask {
-            values_by_head * mask.clone()
+            tokens * mask.clone().squeeze_dim::<3>(1)
         } else {
-            values_by_head
+            tokens
         };
-        let memory_write = k.transpose().matmul(values_for_memory);
+        let memory_write = grouped_memory_write(k, values_for_memory);
         debug_assert_eq!(block_out.dims(), [batch, sequence, dim]);
 
         BdhBlockOutput {
@@ -632,8 +631,54 @@ impl<B: Backend> BdhBlock<B> {
             delta
                 .permute([0, 2, 1, 3])
                 .reshape([batch, sequence, self.heads * self.qk_per_head]);
-        layer_norm_no_params(self.proj_out.forward(delta))
+        layer_norm_no_params(linear(delta, self.proj_out.weight.val()))
     }
+}
+
+/// Compute `[B,H,N,N] @ [B,N,D] -> [B,H,N,D]` without copying V over H.
+fn grouped_head_value_read<B: Backend>(
+    similarity: Tensor<B, 4>,
+    values: Tensor<B, 3>,
+) -> Tensor<B, 4> {
+    let [batch, heads, sequence, keys] = similarity.dims();
+    let [value_batch, value_sequence, dim] = values.dims();
+    debug_assert_eq!(sequence, keys);
+    debug_assert_eq!([value_batch, value_sequence], [batch, sequence]);
+    similarity
+        .permute([0, 2, 1, 3])
+        .reshape([batch, sequence * heads, sequence])
+        .matmul(values)
+        .reshape([batch, sequence, heads, dim])
+        .permute([0, 2, 1, 3])
+}
+
+/// Compute `[B,H,N,D] @ [H,D,Q] -> [B,H,N,Q]` as H grouped GEMMs.
+fn grouped_head_projection<B: ProjectionBackend>(
+    input: Tensor<B, 4>,
+    projection: Tensor<B, 3>,
+) -> Tensor<B, 4> {
+    let [batch, heads, sequence, dim] = input.dims();
+    let [projection_heads, projection_dim, qk_per_head] = projection.dims();
+    debug_assert_eq!([projection_heads, projection_dim], [heads, dim]);
+    projection_matmul(
+        input
+            .permute([1, 0, 2, 3])
+            .reshape([heads, batch * sequence, dim]),
+        projection,
+    )
+    .reshape([heads, batch, sequence, qk_per_head])
+    .permute([1, 0, 2, 3])
+}
+
+/// Compute `K^T V` without copying `[B,N,D]` once for every head.
+fn grouped_memory_write<B: Backend>(keys: Tensor<B, 4>, values: Tensor<B, 3>) -> Tensor<B, 4> {
+    let [batch, heads, sequence, qk_per_head] = keys.dims();
+    let [value_batch, value_sequence, dim] = values.dims();
+    debug_assert_eq!([value_batch, value_sequence], [batch, sequence]);
+    keys.permute([0, 1, 3, 2])
+        .reshape([batch, heads * qk_per_head, sequence])
+        .matmul(values)
+        .reshape([batch, heads, qk_per_head, dim])
 }
 
 /// Internal result of one application of the shared block.
@@ -998,7 +1043,7 @@ fn sequence_metadata<B: Backend>(
     })
 }
 
-impl<B: Backend> Bdh<B> {
+impl<B: ProjectionBackend> Bdh<B> {
     /// Model/value dimension `D`.
     pub fn dim(&self) -> usize {
         self.dim
@@ -1099,16 +1144,16 @@ impl<B: Backend> Bdh<B> {
     /// Project continuous `[B,N,D]` states into vocabulary logits.
     pub fn project_logits(&self, embeddings: Tensor<B, 3>) -> Tensor<B, 3> {
         if let Some(projection) = &self.to_logits {
-            projection.forward(embeddings)
+            linear(embeddings, projection.weight.val())
         } else {
             let [batch, sequence, dim] = embeddings.dims();
             // Flatten batch/sequence so the shared [V,D] embedding is used by
             // one ordinary GEMM. Repeating [D,V] across B would materialize
             // hundreds of MiB in the production microbatch.
-            (embeddings
-                .reshape([batch * sequence, dim])
-                .matmul(self.token_embed.weight.val().transpose())
-                / (dim as f64).sqrt())
+            (projection_matmul(
+                embeddings.reshape([batch * sequence, dim]),
+                self.token_embed.weight.val().transpose(),
+            ) / (dim as f64).sqrt())
             .reshape([batch, sequence, self.num_tokens])
         }
     }
@@ -1288,6 +1333,15 @@ impl<B: Backend> Bdh<B> {
             options.document_starts.as_deref(),
             &tokens.device(),
         )?;
+        // Position ids are identical at all recurrent depths, so the phase
+        // tensors are constructed once for the complete shared-block loop.
+        let rotary = rotary_phases::<B>(
+            &metadata.position_ids,
+            batch,
+            sequence,
+            self.rotary_dim,
+            &tokens.device(),
+        );
 
         let mut history = if self.attention_residual.is_some() {
             Some(
@@ -1320,6 +1374,7 @@ impl<B: Backend> Bdh<B> {
                 previous.as_ref(),
                 neuron_state,
                 &metadata,
+                &rotary,
                 options.memory_read_scale,
             );
             neuron_state = next_neuron_state;
@@ -1435,6 +1490,11 @@ fn retain_cq_per_neuron<B: Backend>(
     heads: usize,
     qk_per_head: usize,
 ) -> Tensor<B, 4> {
+    assert_eq!(
+        retention.dims(),
+        [heads, qk_per_head],
+        "CQ retention parameter shape must match [H,Q]"
+    );
     memory * retention.reshape([1, heads, qk_per_head, 1])
 }
 
@@ -1444,11 +1504,172 @@ mod tests {
     use burn::{
         backend::{Autodiff, NdArray},
         optim::GradientsParams,
+        record::{BinFileRecorder, FullPrecisionSettings, Recorder},
         tensor::{Int, TensorData, Tolerance},
     };
 
     type TestBackend = NdArray<f32>;
     type TrainBackend = Autodiff<TestBackend>;
+
+    #[test]
+    fn grouped_head_values_and_memory_writes_match_materialized_copies() {
+        let device = Default::default();
+        let similarity = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                (0..24).map(|value| value as f32 / 13.0 - 0.5).collect(),
+                [2, 3, 2, 2],
+            ),
+            &device,
+        );
+        let values = Tensor::<TestBackend, 3>::from_data(
+            TensorData::new(
+                (0..16).map(|value| value as f32 / 9.0 - 0.25).collect(),
+                [2, 2, 4],
+            ),
+            &device,
+        );
+
+        let grouped = grouped_head_value_read(similarity.clone(), values.clone());
+        let materialized = similarity.matmul(values.clone().unsqueeze_dim::<4>(1).repeat_dim(1, 3));
+        grouped
+            .into_data()
+            .assert_approx_eq::<f32>(&materialized.into_data(), Tolerance::absolute(1e-6));
+
+        let keys = Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                (0..36).map(|value| value as f32 / 19.0 - 0.4).collect(),
+                [2, 3, 2, 3],
+            ),
+            &device,
+        );
+        let grouped = grouped_memory_write(keys.clone(), values.clone());
+        let materialized = keys
+            .transpose()
+            .matmul(values.unsqueeze_dim::<4>(1).repeat_dim(1, 3));
+        grouped
+            .into_data()
+            .assert_approx_eq::<f32>(&materialized.into_data(), Tolerance::absolute(1e-6));
+    }
+
+    #[test]
+    fn grouped_shared_projection_matches_values_and_gradients() {
+        let device = Default::default();
+        let left_values = (0..48)
+            .map(|value| value as f32 / 17.0 - 0.8)
+            .collect::<Vec<_>>();
+        let weight_values = (0..60)
+            .map(|value| value as f32 / 23.0 - 0.6)
+            .collect::<Vec<_>>();
+
+        let left_grouped = Tensor::<TrainBackend, 4>::from_data(
+            TensorData::new(left_values.clone(), [2, 3, 2, 4]),
+            &device,
+        )
+        .require_grad();
+        let weight_grouped = Tensor::<TrainBackend, 3>::from_data(
+            TensorData::new(weight_values.clone(), [3, 4, 5]),
+            &device,
+        )
+        .require_grad();
+        let output_grouped = grouped_head_projection(left_grouped.clone(), weight_grouped.clone());
+        let output_grouped_data = output_grouped.to_data();
+        let grads_grouped = output_grouped.square().mean().backward();
+        let left_grouped_grad = left_grouped
+            .grad(&grads_grouped)
+            .expect("grouped lhs must receive a gradient");
+        let weight_grouped_grad = weight_grouped
+            .grad(&grads_grouped)
+            .expect("grouped weight must receive a gradient");
+
+        let left_repeat = Tensor::<TrainBackend, 4>::from_data(
+            TensorData::new(left_values, [2, 3, 2, 4]),
+            &device,
+        )
+        .require_grad();
+        let weight_repeat = Tensor::<TrainBackend, 3>::from_data(
+            TensorData::new(weight_values, [3, 4, 5]),
+            &device,
+        )
+        .require_grad();
+        let output_repeat = left_repeat
+            .clone()
+            .matmul(weight_repeat.clone().unsqueeze_dim::<4>(0).repeat_dim(0, 2));
+        let output_repeat_data = output_repeat.to_data();
+        let grads_repeat = output_repeat.square().mean().backward();
+        let left_repeat_grad = left_repeat
+            .grad(&grads_repeat)
+            .expect("materialized lhs must receive a gradient");
+        let weight_repeat_grad = weight_repeat
+            .grad(&grads_repeat)
+            .expect("materialized weight must receive a gradient");
+
+        output_grouped_data.assert_approx_eq::<f32>(&output_repeat_data, Tolerance::absolute(1e-6));
+        left_grouped_grad
+            .into_data()
+            .assert_approx_eq::<f32>(&left_repeat_grad.into_data(), Tolerance::absolute(1e-5));
+        weight_grouped_grad
+            .into_data()
+            .assert_approx_eq::<f32>(&weight_repeat_grad.into_data(), Tolerance::absolute(1e-5));
+    }
+
+    #[test]
+    fn module_record_round_trip_keeps_v2_parameter_shapes() {
+        let device = Default::default();
+        let config = BdhConfig::new(128, 32)
+            .with_depth(3)
+            .with_heads(2)
+            .with_dim_qk_heads(16)
+            .with_attn_residual(true)
+            .with_attn_residual_heads(4)
+            .with_gated_neuron_state(true)
+            .with_cq_memory_decay(true);
+        let model = config.init::<TestBackend>(&device).unwrap();
+        let loaded = config
+            .init::<TestBackend>(&device)
+            .unwrap()
+            .load_record(model.into_record());
+
+        assert_eq!(loaded.cq_retention_probabilities().unwrap().dims(), [2, 8]);
+        assert_eq!(
+            loaded.base_state_update_probabilities().unwrap().dims(),
+            [2, 8]
+        );
+        assert_eq!(loaded.state_injection_strengths().unwrap().dims(), [2, 8]);
+    }
+
+    #[test]
+    fn serialized_module_record_keeps_v2_parameter_shapes() {
+        let device = Default::default();
+        let config = BdhConfig::new(128, 32)
+            .with_depth(3)
+            .with_heads(2)
+            .with_dim_qk_heads(16)
+            .with_attn_residual(true)
+            .with_attn_residual_heads(4)
+            .with_gated_neuron_state(true)
+            .with_cq_memory_decay(true);
+        let model = config.init::<TestBackend>(&device).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "bdh-cq-record-shape-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let recorder = BinFileRecorder::<FullPrecisionSettings>::default();
+        recorder.record(model.into_record(), path.clone()).unwrap();
+        let record = recorder.load(path.clone(), &device).unwrap();
+        let loaded = config
+            .init::<TestBackend>(&device)
+            .unwrap()
+            .load_record(record);
+        std::fs::remove_file(path.with_extension("bin")).unwrap();
+
+        assert_eq!(loaded.cq_retention_probabilities().unwrap().dims(), [2, 8]);
+        assert_eq!(
+            loaded.base_state_update_probabilities().unwrap().dims(),
+            [2, 8]
+        );
+        assert_eq!(loaded.state_injection_strengths().unwrap().dims(), [2, 8]);
+    }
 
     #[test]
     fn wide_delta_transition_matches_the_v2_equations() {
@@ -1506,7 +1727,8 @@ mod tests {
             &device,
         );
         let metadata = sequence_metadata(1, 2, 2, &[0], None, &device).unwrap();
-        let output = block.forward(tokens, None, None, &metadata, 1.0);
+        let rotary = rotary_phases::<TestBackend>(&metadata.position_ids, 1, 2, 2, &device);
+        let output = block.forward(tokens, None, None, &metadata, &rotary, 1.0);
         output.neuron_delta.into_data().assert_approx_eq::<f32>(
             &output
                 .neuron_state
@@ -1530,7 +1752,8 @@ mod tests {
         );
         let previous = Tensor::ones([1, 2, 2, 4], &device);
         let metadata = sequence_metadata(1, 2, 2, &[0], None, &device).unwrap();
-        let output = block.forward(tokens, None, Some(previous), &metadata, 1.0);
+        let rotary = rotary_phases::<TestBackend>(&metadata.position_ids, 1, 2, 2, &device);
+        let output = block.forward(tokens, None, Some(previous), &metadata, &rotary, 1.0);
 
         let projected_delta = block.project_neuron_delta(output.neuron_delta.clone());
         output

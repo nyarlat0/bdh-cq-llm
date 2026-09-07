@@ -177,6 +177,43 @@ pub struct OptimizerConfig {
     pub gradient_clip_norm: f32,
 }
 
+impl OptimizerConfig {
+    /// Number of sequences contributing to one optimizer update.
+    pub fn effective_batch_sequences(&self) -> Option<usize> {
+        self.micro_batch_size
+            .checked_mul(self.gradient_accumulation)
+    }
+
+    /// Whether a saved Adam state may continue under another physical batch
+    /// partition without changing AdamW's effective-batch scaling.
+    ///
+    /// `micro_batch_size=4, accumulation=16` and `2,32` both average the same
+    /// 64 sequence losses before one AdamW update. The physical lane ordering
+    /// and CQ stripe length do change, so all actual optimizer/LR parameters
+    /// must remain identical and the loader permits a switch only at a work-
+    /// block boundary, where lane memory resets.
+    fn continuation_compatible_with(&self, previous: &Self) -> bool {
+        let same_effective_batch = matches!(
+            (
+                self.effective_batch_sequences(),
+                previous.effective_batch_sequences()
+            ),
+            (Some(current), Some(old)) if current == old
+        );
+        same_effective_batch
+            && self.max_learning_rate == previous.max_learning_rate
+            && self.min_learning_rate == previous.min_learning_rate
+            && self.warmup_tokens == previous.warmup_tokens
+            && self.focus_max_learning_rate == previous.focus_max_learning_rate
+            && self.focus_min_learning_rate == previous.focus_min_learning_rate
+            && self.focus_warmup_tokens == previous.focus_warmup_tokens
+            && self.beta_1 == previous.beta_1
+            && self.beta_2 == previous.beta_2
+            && self.weight_decay == previous.weight_decay
+            && self.gradient_clip_norm == previous.gradient_clip_norm
+    }
+}
+
 /// Extra source replay mixed into the Ficbook-focused stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -270,6 +307,13 @@ pub struct PretrainConfig {
     pub sequence_length: usize,
     /// Adjacent examples kept together as one shuffled I/O block.
     pub block_sequences: usize,
+    /// Stable source-tail alignment used when physical microbatching changes.
+    ///
+    /// Missing preserves the historical behavior (`micro_batch_size`). A
+    /// continuation config may pin the old value so it reconstructs exactly
+    /// the same work-block schedule after repartitioning the physical batch.
+    #[serde(default)]
+    pub schedule_batch_multiple: Option<usize>,
     /// Exact per-source token budgets, keyed by stable source name.
     pub sources: BTreeMap<String, SourceBudget>,
     /// Ficbook tokens mixed into phase one; the remainder forms phase two.
@@ -313,6 +357,12 @@ impl PretrainConfig {
             .ok_or_else(|| format!("configuration is missing source {}", source.as_str()))
     }
 
+    /// Effective alignment used to construct deterministic source blocks.
+    pub fn schedule_batch_multiple(&self) -> usize {
+        self.schedule_batch_multiple
+            .unwrap_or(self.optimizer.micro_batch_size)
+    }
+
     /// Reject inconsistent dimensions, budgets and schedules before work starts.
     pub fn validate(&self) -> Result<(), String> {
         if self.format_version != 1 && self.format_version != 2 {
@@ -337,6 +387,18 @@ impl PretrainConfig {
             .is_multiple_of(self.optimizer.micro_batch_size)
         {
             return Err("block_sequences must be divisible by micro_batch_size".into());
+        }
+        if self.schedule_batch_multiple() == 0
+            || !self
+                .block_sequences
+                .is_multiple_of(self.schedule_batch_multiple())
+        {
+            return Err(
+                "schedule_batch_multiple must be non-zero and divide block_sequences".into(),
+            );
+        }
+        if self.optimizer.effective_batch_sequences().is_none() {
+            return Err("micro_batch_size * gradient_accumulation overflows usize".into());
         }
         if self.memory.chunks_per_detach == 0 {
             return Err("memory.chunks_per_detach must be non-zero".into());
@@ -454,9 +516,10 @@ impl PretrainConfig {
 
     /// Check that a checkpoint may continue under a new run contract.
     ///
-    /// Continuation may change the output directory, memory curriculum and
-    /// logging/checkpoint cadence. Model, optimizer, corpus and deterministic
-    /// schedule stay byte-for-byte compatible at the saved cursor.
+    /// Continuation may change the output directory, memory curriculum,
+    /// logging cadence and physical microbatch partition. Model, optimizer
+    /// hyperparameters, effective batch, corpus and deterministic schedule
+    /// stay compatible at the saved cursor.
     pub fn continuation_compatible_with(&self, previous: &Self) -> bool {
         self.format_version == previous.format_version
             && self.tokenizer == previous.tokenizer
@@ -464,11 +527,14 @@ impl PretrainConfig {
             && self.seed == previous.seed
             && self.sequence_length == previous.sequence_length
             && self.block_sequences == previous.block_sequences
+            && self.schedule_batch_multiple() == previous.schedule_batch_multiple()
             && self.sources == previous.sources
             && self.ficbook_phase_one_tokens == previous.ficbook_phase_one_tokens
             && self.focus_replay == previous.focus_replay
             && self.model == previous.model
-            && self.optimizer == previous.optimizer
+            && self
+                .optimizer
+                .continuation_compatible_with(&previous.optimizer)
     }
 }
 
@@ -741,8 +807,8 @@ fn add_range_blocks(
 ) {
     let sequence = config.sequence_length as u64;
     let total_sequences = end.saturating_sub(start).saturating_sub(1) / sequence;
-    let micro_batch = config.optimizer.micro_batch_size as u64;
-    let total_sequences = total_sequences - total_sequences % micro_batch;
+    let schedule_multiple = config.schedule_batch_multiple() as u64;
+    let total_sequences = total_sequences - total_sequences % schedule_multiple;
     let block_sequences = config.block_sequences as u64;
     let mut first_sequence = 0;
     while first_sequence < total_sequences {
@@ -958,5 +1024,62 @@ mod tests {
 
         config.memory.allow_fixed_decay_with_single_chunk = true;
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn continuation_can_repartition_only_the_same_effective_batch() {
+        let previous = PretrainConfig::from_path("configs/rx6700-v2.json").unwrap();
+        let mut candidate = previous.clone();
+        candidate.run_dir = "runs/repartitioned".into();
+        candidate.optimizer.micro_batch_size = 2;
+        candidate.optimizer.gradient_accumulation = 32;
+        assert!(!candidate.continuation_compatible_with(&previous));
+        candidate.schedule_batch_multiple = Some(previous.schedule_batch_multiple());
+        assert!(candidate.continuation_compatible_with(&previous));
+
+        candidate.optimizer.gradient_accumulation = 31;
+        assert!(!candidate.continuation_compatible_with(&previous));
+        candidate.optimizer.gradient_accumulation = 32;
+        candidate.optimizer.beta_2 = 0.99;
+        assert!(!candidate.continuation_compatible_with(&previous));
+    }
+
+    #[test]
+    fn production_mb2_fallback_is_checkpoint_compatible() {
+        let production = PretrainConfig::from_path("configs/rx6700-v2.json").unwrap();
+        let fallback = PretrainConfig::from_path("configs/rx6700-v2-tbptt2-mb2.json").unwrap();
+        assert_eq!(fallback.optimizer.micro_batch_size, 2);
+        assert_eq!(fallback.optimizer.gradient_accumulation, 32);
+        assert_eq!(fallback.memory.chunks_per_detach, 2);
+        assert_eq!(
+            fallback.optimizer.effective_batch_sequences(),
+            production.optimizer.effective_batch_sequences()
+        );
+        assert!(fallback.continuation_compatible_with(&production));
+
+        let production_schedule = TrainingSchedule::build(&production).unwrap();
+        let fallback_schedule = TrainingSchedule::build(&fallback).unwrap();
+        assert_eq!(
+            fallback_schedule.effective_tokens,
+            production_schedule.effective_tokens
+        );
+        assert_eq!(
+            fallback_schedule.phase_two_block,
+            production_schedule.phase_two_block
+        );
+        assert_eq!(
+            fallback_schedule.blocks.len(),
+            production_schedule.blocks.len()
+        );
+        for (fallback_block, production_block) in fallback_schedule
+            .blocks
+            .iter()
+            .zip(production_schedule.blocks.iter())
+        {
+            assert_eq!(fallback_block.phase, production_block.phase);
+            assert_eq!(fallback_block.source, production_block.source);
+            assert_eq!(fallback_block.token_start, production_block.token_start);
+            assert_eq!(fallback_block.sequences, production_block.sequences);
+        }
     }
 }

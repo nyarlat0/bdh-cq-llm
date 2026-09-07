@@ -90,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Ingest a prompt once, then carry its fixed-size memory one byte at a time.
-fn greedy_sample<B: Backend>(
+fn greedy_sample<B: bdh_cq_llm::precision::ProjectionBackend>(
     model: &Bdh<B>,
     prompt: &[u8],
     length: usize,

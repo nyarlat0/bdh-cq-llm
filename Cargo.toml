@@ -7,6 +7,13 @@ description = "A documented Rust/Burn port of lucidrains' public BDH-CQ reconstr
 keywords = ["machine-learning", "bdh", "latent-reasoning", "linear-attention"]
 categories = ["science"]
 
+[features]
+default = []
+# Selects CUDA for train_llm. Fusion remains disabled on both GPU paths.
+cuda = ["burn/cuda", "dep:burn-cubecl"]
+# Experimental FP16 projection inputs with FP32 output and FP32 backward.
+cuda-fp16 = ["cuda"]
+
 [dependencies]
 # Burn Fusion 0.21 keeps every discovered operation-stream execution plan in
 # an unbounded process-local Vec. Stateful document/BPTT training produces many
@@ -20,6 +27,8 @@ serde_json = "1.0"
 sha2 = "0.10"
 thiserror = "2.0"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+burn-autodiff = { version = "0.21.0", default-features = false, features = ["std"] }
+burn-cubecl = { version = "0.21.0", optional = true, default-features = false, features = ["std", "autotune"] }
 
 [profile.dev]
 # Tensor-heavy debug builds are prohibitively slow with no optimization, while

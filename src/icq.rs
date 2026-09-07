@@ -8,12 +8,13 @@
 
 use burn::{
     nn::loss::CrossEntropyLossConfig,
-    tensor::{Int, Tensor, TensorData, backend::Backend},
+    tensor::{Int, Tensor, TensorData},
 };
 
 use crate::{
     error::BdhError,
     model::{Bdh, BdhConfig, Memory},
+    precision::ProjectionBackend as Backend,
     reasoning::{
         GenerateOptions, ReasoningForwardOptions, ReasoningWrapper, ReasoningWrapperConfig, Stage,
     },
