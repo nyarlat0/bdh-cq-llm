@@ -4,9 +4,25 @@ from pathlib import Path
 import unittest
 
 from benchmark_v100_sizes import make_config, parse_result
+from pilot_v100_sizes import CASES, pilot_config
 
 
 class SizeSweepTests(unittest.TestCase):
+    def test_learning_pilots_preserve_recipe(self):
+        base = json.loads(Path("configs/v100-v2.json").read_text())
+        self.assertEqual(CASES, ((512, 8), (640, 8), (768, 8), (1024, 4)))
+        for dim, batch in CASES:
+            cfg = pilot_config(base, dim, batch, "pilot-only", 256)
+            self.assertEqual(cfg["validation_batches"], 384)
+            self.assertEqual(cfg["validation_every_steps"], 256)
+            self.assertEqual(cfg["checkpoint_every_steps"], 256)
+            self.assertEqual(cfg["memory"]["stateful_after_tokens"], 0)
+            self.assertEqual(cfg["memory"]["memory_read_ramp_tokens"], 0)
+            for key, value in base["optimizer"].items():
+                if key not in ("micro_batch_size", "gradient_accumulation"):
+                    self.assertEqual(cfg["optimizer"][key], value)
+            self.assertEqual(cfg["sources"], base["sources"])
+
     def test_shapes_and_budget(self):
         base = json.loads(Path("configs/v100-v2.json").read_text())
         before = json.dumps(base)
