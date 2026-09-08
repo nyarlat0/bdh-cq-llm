@@ -26,6 +26,31 @@ fn v100_config_preserves_architecture_and_batch_sweep_budget() {
 }
 
 #[test]
+fn v100_size_sweep_configs_validate() {
+    use bdh_cq_llm::pretrain::{PretrainConfig, TrainingSchedule};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let base = PretrainConfig::from_path(root.join("configs/v100-v2.json")).unwrap();
+    let mut expected = None;
+    for dim in [512, 640, 768, 1024] {
+        for batch in [1, 2, 4, 8, 16, 32] {
+            let mut cfg = base.clone();
+            cfg.model.dim = dim;
+            cfg.model.dim_qk_heads = 12 * dim;
+            cfg.model.rotary_dim = 3 * dim / 4;
+            cfg.schedule_batch_multiple = Some(32);
+            cfg.optimizer.micro_batch_size = batch;
+            cfg.optimizer.gradient_accumulation = 64 / batch;
+            cfg.memory.stateful_after_tokens = 0;
+            cfg.memory.memory_read_ramp_tokens = 0;
+            cfg.validate().unwrap();
+            let schedule = TrainingSchedule::build(&cfg).unwrap();
+            let budget = (schedule.effective_tokens, schedule.phase_one_tokens);
+            assert_eq!(*expected.get_or_insert(budget), budget);
+        }
+    }
+}
+
+#[test]
 fn grouped_projection_matches_native_forward_and_both_gradients() {
     type B = Autodiff<NdArray<f32>>;
     let device = Default::default();
