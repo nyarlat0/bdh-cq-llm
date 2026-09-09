@@ -47,10 +47,10 @@ class ResumeTests(unittest.TestCase):
                 run = root / label
                 cfg = pilot.pilot_config(base, dim, batch, run, 256)
                 (root / f"{label}.json").write_text(json.dumps(cfg))
-                step = 256 if index == 0 else 512
+                step = 256 if index < 2 else 512
                 save_checkpoint(run, step)
                 (run / "train.jsonl").write_text(json.dumps(dict(
-                    event="validation", step=step, selected_loss=7.0)) + "\n")
+                    event="validation", step=256, selected_loss=7.0)) + "\n")
                 (root / f"{label}.log").write_text("model parameters: 123\n")
             (root / "STOP").touch()
             (root / "fp32-d512-b8/STOP").touch()
@@ -59,12 +59,12 @@ class ResumeTests(unittest.TestCase):
             def fake_process(args, **kwargs):
                 calls.append(args)
                 self.assertEqual(args[-1], "256")  # NOT another 512 updates
-                run = root / "fp32-d512-b8"
+                cfg = json.loads(Path(args[args.index("--config") + 1]).read_text())
+                run = Path(cfg["run_dir"])
                 save_checkpoint(run, 512)
-                with (run / "train.jsonl").open("a") as stream:
-                    stream.write(json.dumps(dict(event="validation", step=512, selected_loss=6.0)) + "\n")
+                # Real trainer skips validation at --max-steps: reproduce that
+                # protocol, rather than inventing a final validation in the mock.
                 log = ("model parameters: 123\nstep 304 | loss 7.0 | 4000 tok/s\n"
-                       "validation step 512: memoryless 6.1, stateful Some(6.0), best 6.0\n"
                        "requested --max-steps reached at a safe block boundary\n")
                 return SimpleNamespace(stdout=io.StringIO(log), wait=lambda: 0)
 
@@ -73,15 +73,20 @@ class ResumeTests(unittest.TestCase):
                  patch.object(pilot, "command", return_value=SimpleNamespace(stdout="release 12.9")), \
                  patch.object(pilot.subprocess, "Popen", side_effect=fake_process), patch("sys.stdout", io.StringIO()):
                 pilot.main()
-                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(calls), 2)
                 # Saved budget now suffices; all four completed cases skipped.
                 with patch("sys.argv", ["pilot", "--resume", str(root)]):
                     pilot.main()
-                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(calls), 2)
             self.assertFalse((root / "STOP").exists())
             self.assertTrue(list(root.glob("STOP.acknowledged-*")))
             self.assertEqual(json.loads((root / "pilot.json").read_text())["updates"], 512)
             self.assertEqual(len(json.loads((root / "results.json").read_text())), 4)
+            for row in json.loads((root / "results.json").read_text()):
+                self.assertTrue(row["completed"])
+                self.assertTrue(row["eligible"])
+                self.assertEqual(row["last_validation_step"], 256)
+                self.assertFalse(row["final_validation_present"])
 
 
 if __name__ == "__main__":

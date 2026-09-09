@@ -98,14 +98,15 @@ def write_summary(output, rows):
     (output / "results.json").write_text(json.dumps(rows, indent=2) + "\n")
     lines = ["# V100 size learning pilots", "",
              "Fresh FP32 runs, same token budget/LR, CQ active from token zero. "
-             "Only completed finite runs with final validation are eligible. "
+             "Completed finite runs with recorded validation are eligible. "
+             "Last loss is measured at Val step, not necessarily the final training step. "
              "A single seed and shared LR do not establish optimal quality for each width.", "",
-             "| D | Batch | Params | Completed | Eligible | Best loss | Last loss | tok/s | Wall hours | Approx time |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+             "| D | Batch | Params | Completed | Eligible | Best loss | Last loss | Val step | tok/s | Wall hours | Approx time |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for row in rows:
         lines.append("| " + " | ".join(str(row.get(key)) for key in
                      ("dim", "batch", "parameters", "completed", "eligible", "best_loss",
-                      "last_loss", "median_tok_s", "wall_hours", "wall_time_approximate")) + " |")
+                      "last_loss", "last_validation_step", "median_tok_s", "wall_hours", "wall_time_approximate")) + " |")
     lines += ["", "Use validation.csv for loss versus tokens and wall_seconds; "
               "per-source BPB and memoryless/stateful metrics remain in each train.jsonl. "
               "Wall time includes initialization, validation and preceding checkpoints. "
@@ -226,21 +227,25 @@ def main():
             committed = checkpoint_step(output / label)
             if committed == args.updates:
                 events = load_events(output / label / "train.jsonl")
-                if not any(e.get("event") == "validation" and e["step"] == committed for e in events):
-                    raise SystemExit(f"{label}: final checkpoint exists but final validation is missing")
                 print(f"Skipping completed {label}, step {committed}", flush=True)
-                if not any(r["dim"] == dim and r.get("eligible") for r in rows):
-                    validation = [e for e in events if e.get("event") == "validation" and e["step"] <= committed]
-                    content = (output / f"{label}.log").read_text()
-                    row = parse_result(content, 0, 32)
-                    final = validation[-1]
-                    row.update(dim=dim, batch=batch, completed=True,
-                               eligible=all(math.isfinite(e["selected_loss"]) for e in validation),
-                               best_loss=min(e["selected_loss"] for e in validation), last_loss=final["selected_loss"],
-                               wall_hours=max((e.get("elapsed_seconds", 0) for e in events), default=0)/3600,
-                               wall_time_approximate=True)
-                    rows = [r for r in rows if r["dim"] != dim] + [row]
-                    write_summary(output, rows)
+                # Reconstruct reports even if the old harness rejected this case.
+                validation = [e for e in events if e.get("event") == "validation" and e["step"] <= committed]
+                content = (output / f"{label}.log").read_text()
+                row = parse_result(content, 0, 32)
+                final = validation[-1] if validation else None
+                clock_path = output / f"{label}.time.json"
+                clock = json.loads(clock_path.read_text()) if clock_path.exists() else dict(
+                    seconds=max((e.get("elapsed_seconds", 0) for e in events), default=0), approximate=True)
+                row.update(dim=dim, batch=batch, completed=True,
+                           eligible=bool(validation) and all(math.isfinite(e["selected_loss"]) for e in validation),
+                           best_loss=min((e["selected_loss"] for e in validation), default=None),
+                           last_loss=final["selected_loss"] if final else None,
+                           last_validation_step=final["step"] if final else None,
+                           final_validation_present=bool(final and final["step"] == committed),
+                           wall_hours=clock["seconds"]/3600,
+                           wall_time_approximate=clock["approximate"] or clock.get("active", False))
+                rows = [r for r in rows if r["dim"] != dim] + [row]
+                write_summary(output, rows)
                 continue
             if (output / "STOP").exists():
                 raise SystemExit("pilot sequence STOP requested")
@@ -301,20 +306,22 @@ def main():
             row = parse_result(content, status, committed + 32)
             events_path = output / label / "train.jsonl"
             events = load_events(events_path)
-            validation = [e for e in events if e.get("event") == "validation"]
+            validation = [e for e in events if e.get("event") == "validation" and e["step"] <= args.updates]
             row["eligible"] = bool(row["completed"] and row["finite"] and validation
-                                   and validation[-1]["step"] == args.updates
                                    and all(math.isfinite(e["selected_loss"]) for e in validation)
                                    and checkpoint_step(output / label) == args.updates)
             row.update(dim=dim, batch=batch, wall_hours=clock["seconds"] / 3600,
                        wall_time_approximate=clock["approximate"],
                        best_loss=min((e["selected_loss"] for e in validation), default=None),
+                       last_validation_step=validation[-1]["step"] if validation else None,
+                       final_validation_present=bool(validation and validation[-1]["step"] == args.updates),
                        last_loss=validation[-1]["selected_loss"] if validation else None)
             rows = [r for r in rows if r["dim"] != dim] + [row]
             write_summary(output, rows)
             # No automatic smaller-batch retry: that would silently change the
             # agreed experiment. STOP/non-finite/OOM all stop the sequence.
-            if not row["eligible"] or (output / "STOP").exists():
+            if (not row["completed"] or not row["finite"]
+                    or checkpoint_step(output / label) != args.updates or (output / "STOP").exists()):
                 raise SystemExit(f"Sequence stopped; inspect {output / 'summary.md'} and {label}.log")
     print(f"Done: {output / 'summary.md'}. No production training started.")
     lock.close()
