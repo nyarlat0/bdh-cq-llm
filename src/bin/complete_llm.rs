@@ -11,6 +11,7 @@
 //! carries CQ fast-weight memory through input fragments and generated tokens.
 //! `/reset` starts another document.
 
+use bdh_cq_llm::precision::ProjectionBackend;
 use bdh_cq_llm::pretrain::{PretrainConfig, hex_digest, sha256_file};
 use bdh_cq_llm::{Bdh, BdhConfig, BdhForwardOptions, Memory, ModelInput};
 use burn::{
@@ -178,7 +179,7 @@ fn run_repl(
 ) -> Result<(), AnyError> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
-    let mut memory: Option<Memory<InferenceBackend>> = None;
+    let mut memory: Option<CompletionState<InferenceBackend>> = None;
     let mut document_start_pending = true;
 
     loop {
@@ -205,7 +206,12 @@ fn run_repl(
                 println!(
                     "stream memory: {} tokens",
                     memory.as_ref().map_or(0, |value| {
-                        value.position_offsets.first().copied().unwrap_or(0)
+                        value
+                            .committed
+                            .as_ref()
+                            .and_then(|m| m.position_offsets.first().copied())
+                            .unwrap_or(0)
+                            + value.pending.len()
                     })
                 );
                 continue;
@@ -296,46 +302,75 @@ fn prepare_prompt_tokens(
     tokens
 }
 
-/// Ingest arbitrary-length text in the same 256-token chunks used for
-/// pretraining. Local causal attention handles each chunk; CQ memory connects
-/// all chunks, generated continuations, and later user-supplied fragments.
-fn ingest_tokens(
-    model: &Bdh<InferenceBackend>,
-    mut memory: Option<Memory<InferenceBackend>>,
+/// CQ contains only completed chunks. The unfinished token prefix remains
+/// explicit so every next-token prediction retains local causal attention.
+/// Re-evaluating that prefix must always start from the SAME committed memory:
+/// feeding tentative output memory back would duplicate writes and retention.
+struct CompletionState<B: Backend> {
+    committed: Option<Memory<B>>,
+    pending: Vec<usize>,
+    chunk_size: usize,
+}
+
+/// Append prompt/generated IDs, committing CQ exactly once per full chunk.
+/// Partial chunks are recomputed (no KV-cache implementation) and their
+/// tentative memory is discarded. This preserves chunk-level CQ decay and
+/// RoPE offsets, including when a later REPL fragment extends the same chunk.
+fn ingest_tokens<B: ProjectionBackend>(
+    model: &Bdh<B>,
+    memory: Option<CompletionState<B>>,
     tokens: &[usize],
     chunk_size: usize,
-    device: &WgpuDevice,
-) -> Result<(Memory<InferenceBackend>, Tensor<InferenceBackend, 3>), AnyError> {
+    device: &B::Device,
+) -> Result<(CompletionState<B>, Tensor<B, 3>), AnyError> {
     if tokens.is_empty() || chunk_size == 0 {
         return Err("prompt tokens and chunk size must be non-empty".into());
     }
+    let mut state = memory.unwrap_or(CompletionState {
+        committed: None,
+        pending: Vec::new(),
+        chunk_size,
+    });
+    if state.chunk_size != chunk_size {
+        return Err("cannot change chunk size within a completion stream".into());
+    }
     let mut last_logits = None;
-    for chunk in tokens.chunks(chunk_size) {
-        let input = ids_tensor(chunk, device);
+    let mut remaining = tokens;
+    while !remaining.is_empty() {
+        let count = remaining.len().min(chunk_size - state.pending.len());
+        state.pending.extend_from_slice(&remaining[..count]);
+        remaining = &remaining[count..];
+        let input = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(
+                state.pending.iter().map(|t| *t as i64).collect::<Vec<_>>(),
+                [1, state.pending.len()],
+            ),
+            device,
+        );
         let output = model.forward(
             ModelInput::TokenIds(input),
-            memory,
+            state.committed.clone(),
             BdhForwardOptions::default(),
         )?;
         last_logits = output.logits;
-        memory = Some(output.memory);
+        if state.pending.len() == chunk_size {
+            state.committed = Some(output.memory);
+            state.pending.clear();
+        }
     }
-    Ok((
-        memory.expect("non-empty input produced memory"),
-        last_logits.expect("default forward returns logits"),
-    ))
+    Ok((state, last_logits.expect("default forward returns logits")))
 }
 
 /// Autoregress using discrete token IDs, matching language-model pretraining.
 ///
 /// `ReasoningWrapper::generate` deliberately uses raw embeddings to reproduce
 /// upstream latent-reasoning behavior. That is not the path trained by
-/// `train_llm`, so text completion performs a normal token forward after every
-/// sample instead.
+/// `train_llm`, so text completion appends discrete IDs and recomputes the
+/// current chunk prefix after each sample instead.
 #[allow(clippy::too_many_arguments)]
 fn generate_tokens(
     model: &Bdh<InferenceBackend>,
-    mut memory: Memory<InferenceBackend>,
+    mut memory: CompletionState<InferenceBackend>,
     mut logits: Tensor<InferenceBackend, 3>,
     document_token: usize,
     banned_tokens: &[usize],
@@ -344,7 +379,7 @@ fn generate_tokens(
     top_k: usize,
     rng: &mut StdRng,
     device: &WgpuDevice,
-) -> Result<(Vec<usize>, Memory<InferenceBackend>, bool), AnyError> {
+) -> Result<(Vec<usize>, CompletionState<InferenceBackend>, bool), AnyError> {
     let mut generated = Vec::with_capacity(max_new_tokens);
     let mut document_ended = false;
     for _ in 0..max_new_tokens {
@@ -359,13 +394,8 @@ fn generate_tokens(
         }
         generated.push(token);
 
-        let output = model.forward(
-            ModelInput::TokenIds(ids_tensor(&[token], device)),
-            Some(memory),
-            BdhForwardOptions::default(),
-        )?;
-        logits = output.logits.expect("default forward returns logits");
-        memory = output.memory;
+        let chunk_size = memory.chunk_size;
+        (memory, logits) = ingest_tokens(model, Some(memory), &[token], chunk_size, device)?;
     }
     Ok((generated, memory, document_ended))
 }
@@ -431,16 +461,6 @@ fn sample_from_values(
         }
     }
     Ok(candidates.last().expect("non-empty candidates").0)
-}
-
-fn ids_tensor(tokens: &[usize], device: &WgpuDevice) -> Tensor<InferenceBackend, 2, Int> {
-    Tensor::from_data(
-        TensorData::new(
-            tokens.iter().map(|token| *token as i64).collect::<Vec<_>>(),
-            [1, tokens.len()],
-        ),
-        device,
-    )
 }
 
 fn required_token(tokenizer: &Tokenizer, token: &str) -> Result<usize, AnyError> {
@@ -569,6 +589,75 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_prefix_replay_matches_fixed_chunk_forward() {
+        type B = burn::backend::NdArray<f32>;
+        let device = Default::default();
+        let model = BdhConfig::new(32, 8)
+            .with_heads(2)
+            .with_depth(2)
+            .with_dim_qk_heads(16)
+            .with_rotary_dim(4)
+            .with_tie_embeddings(true)
+            .with_gated_neuron_state(true)
+            .with_attn_residual(true)
+            .with_attn_residual_heads(2)
+            .with_normalize_each_depth(true)
+            .with_cq_memory_decay(true)
+            .init::<B>(&device)
+            .unwrap();
+        let ids = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut state = None;
+        for end in 1..=ids.len() {
+            let (next, actual) =
+                ingest_tokens(&model, state, &ids[end - 1..end], 4, &device).unwrap();
+            assert_eq!(next.pending.len(), end % 4);
+            assert_eq!(
+                next.committed.as_ref().map_or(0, |m| m.position_offsets[0]),
+                end / 4 * 4
+            );
+            // Independent reference: full chunks followed by one partial
+            // prefix, with normal model.forward calls (not the ingestion API).
+            let mut reference_memory = None;
+            let mut expected = None;
+            for chunk in ids[..end].chunks(4) {
+                let input = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(
+                        chunk.iter().map(|t| *t as i64).collect::<Vec<_>>(),
+                        [1, chunk.len()],
+                    ),
+                    &device,
+                );
+                let output = model
+                    .forward(
+                        ModelInput::TokenIds(input),
+                        reference_memory,
+                        BdhForwardOptions::default(),
+                    )
+                    .unwrap();
+                reference_memory = Some(output.memory);
+                expected = output.logits;
+            }
+            let actual = actual.into_data().to_vec::<f32>().unwrap();
+            let expected = expected.unwrap().into_data().to_vec::<f32>().unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (a, b) in actual.iter().zip(expected) {
+                assert!((a - b).abs() < 1e-5);
+            }
+            state = Some(next);
+        }
+        // A whole user fragment must also fill an existing partial chunk,
+        // not implicitly start a new CQ chunk at the REPL turn boundary.
+        let (first, _) = ingest_tokens(&model, None, &ids[..3], 4, &device).unwrap();
+        let (joined, logits) = ingest_tokens(&model, Some(first), &ids[3..], 4, &device).unwrap();
+        let (whole, expected) = ingest_tokens(&model, None, &ids, 4, &device).unwrap();
+        assert_eq!(joined.pending, whole.pending);
+        assert_eq!(
+            logits.into_data().to_vec::<f32>().unwrap(),
+            expected.into_data().to_vec::<f32>().unwrap()
+        );
+    }
 
     #[test]
     fn document_marker_is_the_only_implicit_prompt_token() {

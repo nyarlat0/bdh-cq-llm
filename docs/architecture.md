@@ -413,3 +413,17 @@ execution behavior.
 
 Run `cargo doc --offline --no-deps` for browsable API documentation, and use
 `RUST_BACKTRACE=1` if experimenting with low-level invalid tensor shapes.
+# Text completion: chunk-aligned decoding
+
+`complete_llm` samples discrete tokens autoregressively, but evaluates the
+entire unfinished local chunk prefix for each next-token prediction. It keeps
+CQ memory from completed chunks separately from pending token IDs. Tentative
+memory from a partial prefix is discarded; a full chunk is committed exactly
+once. Replaying a prefix always uses the same chunk-start CQ state, avoiding
+duplicate writes and repeated retention. Later REPL input extends the pending
+chunk; `/reset` and a sampled document boundary discard both states.
+
+This is a correctness-first implementation without a local KV cache: decoding
+recomputes the prefix and may be slower than single-token forwards. Chunk size
+comes from the training config. It does not change training or checkpoint
+format and does not propagate token-aligned wide state across chunks.
