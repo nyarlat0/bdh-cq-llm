@@ -52,6 +52,7 @@ def svg_chart(
     subtitle: str,
     y_label: str,
     output: Path,
+    x_label: str = "training tokens, millions",
 ) -> None:
     """Draw a deterministic line chart suitable for Markdown documentation."""
 
@@ -62,6 +63,8 @@ def svg_chart(
     points = [point for _, values in series.values() for point in values]
     x_values = sorted({point[0] for point in points})
     x_min, x_max = min(x_values), max(x_values)
+    if x_min == x_max:
+        x_min, x_max = x_min - 0.5, x_max + 0.5
     raw_y_min = min(point[1] for point in points)
     raw_y_max = max(point[1] for point in points)
     y_padding = max((raw_y_max - raw_y_min) * 0.08, 0.001)
@@ -89,7 +92,8 @@ def svg_chart(
         lines.append(f'<line class="grid" x1="{left}" y1="{py:.2f}" x2="{width-right}" y2="{py:.2f}"/>')
         lines.append(f'<text class="tick" x="{left-12}" y="{py+4:.2f}" text-anchor="end">{value:.3f}</text>')
 
-    for value in x_values:
+    ticks = x_values if len(x_values) <= 12 else [x_min + i * (x_max - x_min) / 5 for i in range(6)]
+    for value in ticks:
         px = x(value)
         lines.append(f'<line class="grid" x1="{px:.2f}" y1="{top}" x2="{px:.2f}" y2="{height-bottom}"/>')
         lines.append(f'<text class="tick" x="{px:.2f}" y="{height-bottom+24}" text-anchor="middle">{value:.3g}</text>')
@@ -98,7 +102,7 @@ def svg_chart(
         [
             f'<line class="axis" x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}"/>',
             f'<line class="axis" x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}"/>',
-            f'<text class="tick" x="{left + plot_width/2:.2f}" y="{height-24}" text-anchor="middle">training tokens, millions</text>',
+            f'<text class="tick" x="{left + plot_width/2:.2f}" y="{height-24}" text-anchor="middle">{html.escape(x_label)}</text>',
             f'<text class="tick" transform="translate(22 {top + plot_height/2:.2f}) rotate(-90)" text-anchor="middle">{html.escape(y_label)}</text>',
         ]
     )
@@ -122,7 +126,7 @@ def svg_chart(
         lines.append(f'<text class="legend" x="{legend_x+26}" y="{legend_y+4}">{html.escape(name)}</text>')
         legend_x += label_width
 
-    lines.append(f'<text class="tick" x="{width-right}" y="{height-10}" text-anchor="end">generated from fixed-budget train.jsonl logs</text>')
+    lines.append(f'<text class="tick" x="{width-right}" y="{height-10}" text-anchor="end">observed log values; no extrapolation</text>')
     lines.append("</svg>")
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

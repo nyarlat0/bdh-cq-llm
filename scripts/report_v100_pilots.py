@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Reproduce the V100 size-pilot report and SVG curves from copied raw logs."""
+import argparse
+import csv
+import json
+import math
+from pathlib import Path
+import statistics
+
+from plot_v2_pilot_results import svg_chart
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("runs", type=Path, nargs="?", default=Path("runs/v100-size-pilots-20260908-131245-087810"))
+    args = parser.parse_args()
+    output = Path("docs")
+    assets = output / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    rows = json.loads((args.runs / "results.json").read_text())
+    with (args.runs / "validation.csv").open() as stream:
+        timings = {(int(r["dim"]), int(r["step"])): float(r["wall_seconds"]) for r in csv.DictReader(stream)}
+    tokens, times, deltas = {}, {}, {}
+    table, source_table, thresholds = [], [], []
+    baseline = None
+    for row, color in zip(sorted(rows, key=lambda r: r["dim"]), ("#2563eb", "#16a34a", "#9333ea", "#dc2626")):
+        dim, batch = row["dim"], row["batch"]
+        run = args.runs / f"fp32-d{dim}-b{batch}"
+        events = [json.loads(line) for line in (run / "train.jsonl").read_text().splitlines() if line.strip()]
+        train = [e for e in events if e["event"] == "train"]
+        validation = [e for e in events if e["event"] == "validation"]
+        assert train[-1]["step"] == 3072
+        assert json.loads((run / "checkpoints/latest.json").read_text())["optimizer_step"] == 3072
+        assert [e["step"] for e in validation] == list(range(256, 3072, 256))
+        assert all(math.isfinite(e["loss"]) for e in train)
+        assert all(math.isfinite(e["stateful_loss"]) for e in validation)
+        label = f"{row['parameters']/1e6:.1f}M"
+        tokens[label] = (color, [(e["tokens_seen"]/1e6, e["stateful_loss"]) for e in validation])
+        times[label + (" ~time" if row["wall_time_approximate"] else "")] = (
+            color, [(timings[dim, e["step"]]/3600, e["stateful_loss"]) for e in validation])
+        if baseline is None:
+            baseline = {e["step"]: e["stateful_loss"] for e in validation}
+        deltas[label] = (color, [(e["tokens_seen"]/1e6, e["stateful_loss"]-baseline[e["step"]]) for e in validation])
+        last = validation[-1]
+        speed = statistics.median(e["tokens_per_second"] for e in train[-20:])
+        approx = "~" if row["wall_time_approximate"] else ""
+        table.append(f"| {label} | {dim} | {batch} | {last['stateful_loss']:.5f} | {last['memoryless_loss']:.5f} | {speed:.0f} | {approx}{row['wall_hours']:.2f} |")
+        bpb = [last["per_source"][s]["stateful_bits_per_byte"] for s in ("fineweb2_hq", "ficbook", "ru_classic")]
+        source_table.append(f"| {label} | " + " | ".join(f"{v:.4f}" for v in bpb) + " |")
+        first = next(e for e in validation if e["stateful_loss"] <= 7)
+        thresholds.append(f"| {label} | {first['tokens_seen']/1e6:.2f} | {approx}{timings[dim,first['step']]/3600:.2f} |")
+    svg_chart(tokens, "V100 size pilots: loss versus tokens", "FP32; same recipe and token budget; RoPE = Q/2", "stateful validation loss", assets / "v100-size-loss-tokens.svg")
+    svg_chart(times, "V100 size pilots: loss versus elapsed time", "~time: approximate after interruptions; downtime excluded; setup/evaluation included", "stateful validation loss", assets / "v100-size-loss-time.svg", "active elapsed hours (some approximate)")
+    svg_chart(deltas, "V100 size pilots: loss difference versus 22M", "Matched validation steps; negative values beat the 22M baseline", "stateful loss difference", assets / "v100-size-loss-delta.svg")
+    report = """# V100: пилоты размера модели
+
+## Протокол и проверка
+
+Это наши experimental v2 extensions, не результаты опубликованного BDH-CQ.
+Четыре модели завершили 3072 update, по **50 331 648 токенов**.
+Проверены сырые train.jsonl и указатели финальных чекпоинтов: шаг 3072;
+192 тренировочные записи и 11 валидаций на модель, записанные loss конечны.
+Последняя валидация — **шаг 2816, 46 137 344 токена**, не финальный чекпоинт:
+тренер пропускает validation при достижении --max-steps.
+
+FP32 CUDA на V100; seed=42, словарь 24576, D=512/640/768/1024,
+H=8, Q=1.5D, RoPE=Q/2, shared depth=8, MHAR=8, delta wide-state,
+per-neuron gates/retention и нормализация неизменны. TBPTT=2×256.
+CQ включена полностью с начала; effective batch=64, физический batch=8/8/8/4.
+Одинаковый LR: warm-up 10M, max=3e-4, исходный полный горизонт decay;
+это ранний префикс обучения, без отдельной настройки LR под каждый размер.
+Валидация: одни и те же 384 чанка (128 на источник), по одной последовательности.
+Разный physical batch меняет группировку документов по потокам.
+
+## Результаты
+
+Loss в таблице — последняя валидация; он же минимальный у всех моделей.
+tok/s пересчитан одинаково: медиана последних 20 train-записей, а не разных
+отрезков attempt-логов. Часы — сохранённое суммарное время пилота с накладными
+расходами. `~` означает приблизительное восстановление после прерываний;
+для 22М и 63М точное сравнение времени невозможно.
+
+| Параметры | D | Batch | CQ loss | Без CQ loss | tok/s | Часы |
+|---|---|---|---|---|---|---|
+""" + "\n".join(table) + """
+
+![Loss по токенам](assets/v100-size-loss-tokens.svg)
+
+![Разность loss](assets/v100-size-loss-delta.svg)
+
+| Параметры | FineWeb BPB | Ficbook BPB | Classic BPB |
+|---|---|---|---|
+""" + "\n".join(source_table) + """
+
+## Скорость достижения качества
+
+![Loss по времени](assets/v100-size-loss-time.svg)
+
+Первое **наблюдавшееся** достижение stateful validation loss ≤ 7:
+между валидациями момент пересечения неизвестен, интерполяция не используется.
+
+| Параметры | Токены, млн | Активные часы |
+|---|---|---|
+""" + "\n".join(thresholds) + """
+
+## Выводы и ограничения
+
+- При равном числе токенов большая модель лучше на всех трёх источниках.
+  Относительно 22М loss снижен на 0.10975 / 0.19513 / 0.35264 nat для
+  30.5/40.1/63М: perplexity ниже примерно на 10.4% / 17.7% / 29.7%.
+- Большие модели требуют меньше токенов до loss ≤ 7, но по наблюдаемым
+  временным отметкам проходят этот порог позже. Рост размера не означает
+  ускорения достижения качества на одной V100.
+- 63М даёт лучший loss при фиксированном бюджете токенов, но имеет самый
+  дорогой запуск. 22М — быстрый вариант для коротких итераций. 30.5М —
+  промежуточный компромисс; универсального победителя по конечному качеству нет.
+- Включение CQ при валидации снижает loss на 0.083/0.091/0.101/0.120 nat.
+  Это сравнение read-on/read-off одной модели, не отдельное обучение без CQ
+  и не доказательство устойчивого извлечения информации из длинного контекста.
+- Один seed, короткий бюджет и единый LR не позволяют предсказать итог на 1B,
+  сравнить оптимально настроенные размеры или гарантировать качество генерации.
+  Старые RX architecture/RoPE pilots имели другие TBPTT и режим CQ;
+  абсолютные loss нельзя трактовать как чистую архитектурную регрессию.
+
+## Воспроизведение и график отдельного рана
+
+```bash
+python3 scripts/report_v100_pilots.py
+python3 scripts/plot_loss.py runs/ИМЯ_РАНА/train.jsonl --x tokens --smooth 10 -o /tmp/loss.svg
+python3 scripts/plot_loss.py /path/to/console.log -o /tmp/console-loss.svg
+```
+
+Графики SVG, только стандартная библиотека Python. plot_loss принимает также
+директорию рана, строит train/memoryless/stateful кривые, не требует завершённого
+обучения. Это снимок: повторный вызов обновляет SVG. Последняя оборванная JSON
+строка игнорируется с предупреждением; повреждение в середине — ошибка.
+Сглаживается только train loss, по числу записей, не optimizer steps.
+Для console-логов без счётчика токенов в точках validation используйте ось steps.
+Скачки step назад считаются перезапуском: более поздние старые точки удаляются.
+Сохраняйте исходные логи: график не восстанавливает отсутствующие данные.
+"""
+    (output / "v100-size-pilot-results.md").write_text(report)
+    print(output / "v100-size-pilot-results.md")
+
+
+if __name__ == "__main__":
+    main()

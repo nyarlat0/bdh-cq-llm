@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560" role="img">
+<title>V100 size pilots: loss difference versus 22M</title>
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:ui-sans-serif,system-ui,sans-serif;fill:#172033}.title{font-size:22px;font-weight:700}.subtitle{font-size:13px;fill:#526071}.tick{font-size:12px;fill:#526071}.legend{font-size:12px}.axis{stroke:#7b8794;stroke-width:1}.grid{stroke:#dce3ea;stroke-width:1}.line{fill:none;stroke-width:3;stroke-linejoin:round;stroke-linecap:round}.point{stroke:#fff;stroke-width:1.5}</style>
+<text class="title" x="88" y="34">V100 size pilots: loss difference versus 22M</text>
+<text class="subtitle" x="88" y="57">Matched validation steps; negative values beat the 22M baseline</text>
+<line class="grid" x1="88" y1="488.00" x2="932" y2="488.00"/>
+<text class="tick" x="76" y="492.00" text-anchor="end">-0.543</text>
+<line class="grid" x1="88" y1="407.60" x2="932" y2="407.60"/>
+<text class="tick" x="76" y="411.60" text-anchor="end">-0.426</text>
+<line class="grid" x1="88" y1="327.20" x2="932" y2="327.20"/>
+<text class="tick" x="76" y="331.20" text-anchor="end">-0.310</text>
+<line class="grid" x1="88" y1="246.80" x2="932" y2="246.80"/>
+<text class="tick" x="76" y="250.80" text-anchor="end">-0.193</text>
+<line class="grid" x1="88" y1="166.40" x2="932" y2="166.40"/>
+<text class="tick" x="76" y="170.40" text-anchor="end">-0.076</text>
+<line class="grid" x1="88" y1="86.00" x2="932" y2="86.00"/>
+<text class="tick" x="76" y="90.00" text-anchor="end">0.040</text>
+<line class="grid" x1="88.00" y1="86" x2="88.00" y2="488"/>
+<text class="tick" x="88.00" y="512" text-anchor="middle">4.19</text>
+<line class="grid" x1="172.40" y1="86" x2="172.40" y2="488"/>
+<text class="tick" x="172.40" y="512" text-anchor="middle">8.39</text>
+<line class="grid" x1="256.80" y1="86" x2="256.80" y2="488"/>
+<text class="tick" x="256.80" y="512" text-anchor="middle">12.6</text>
+<line class="grid" x1="341.20" y1="86" x2="341.20" y2="488"/>
+<text class="tick" x="341.20" y="512" text-anchor="middle">16.8</text>
+<line class="grid" x1="425.60" y1="86" x2="425.60" y2="488"/>
+<text class="tick" x="425.60" y="512" text-anchor="middle">21</text>
+<line class="grid" x1="510.00" y1="86" x2="510.00" y2="488"/>
+<text class="tick" x="510.00" y="512" text-anchor="middle">25.2</text>
+<line class="grid" x1="594.40" y1="86" x2="594.40" y2="488"/>
+<text class="tick" x="594.40" y="512" text-anchor="middle">29.4</text>
+<line class="grid" x1="678.80" y1="86" x2="678.80" y2="488"/>
+<text class="tick" x="678.80" y="512" text-anchor="middle">33.6</text>
+<line class="grid" x1="763.20" y1="86" x2="763.20" y2="488"/>
+<text class="tick" x="763.20" y="512" text-anchor="middle">37.7</text>
+<line class="grid" x1="847.60" y1="86" x2="847.60" y2="488"/>
+<text class="tick" x="847.60" y="512" text-anchor="middle">41.9</text>
+<line class="grid" x1="932.00" y1="86" x2="932.00" y2="488"/>
+<text class="tick" x="932.00" y="512" text-anchor="middle">46.1</text>
+<line class="axis" x1="88" y1="86" x2="88" y2="488"/>
+<line class="axis" x1="88" y1="488" x2="932" y2="488"/>
+<text class="tick" x="510.00" y="536" text-anchor="middle">training tokens, millions</text>
+<text class="tick" transform="translate(22 287.00) rotate(-90)" text-anchor="middle">stateful loss difference</text>
+<polyline class="line" stroke="#2563eb" points="88.00,113.72 172.40,113.72 256.80,113.72 341.20,113.72 425.60,113.72 510.00,113.72 594.40,113.72 678.80,113.72 763.20,113.72 847.60,113.72 932.00,113.72"/>
+<circle class="point" cx="88.00" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="172.40" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="256.80" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="341.20" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="425.60" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="510.00" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="594.40" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="678.80" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="763.20" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="847.60" cy="113.72" r="3.5" fill="#2563eb"/>
+<circle class="point" cx="932.00" cy="113.72" r="3.5" fill="#2563eb"/>
+<polyline class="line" stroke="#16a34a" points="88.00,197.83 172.40,220.70 256.80,213.29 341.20,197.32 425.60,201.62 510.00,194.43 594.40,202.53 678.80,192.61 763.20,197.04 847.60,189.95 932.00,189.37"/>
+<circle class="point" cx="88.00" cy="197.83" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="172.40" cy="220.70" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="256.80" cy="213.29" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="341.20" cy="197.32" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="425.60" cy="201.62" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="510.00" cy="194.43" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="594.40" cy="202.53" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="678.80" cy="192.61" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="763.20" cy="197.04" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="847.60" cy="189.95" r="3.5" fill="#16a34a"/>
+<circle class="point" cx="932.00" cy="189.37" r="3.5" fill="#16a34a"/>
+<polyline class="line" stroke="#9333ea" points="88.00,263.80 172.40,290.21 256.80,306.00 341.20,279.96 425.60,278.82 510.00,251.34 594.40,266.22 678.80,253.68 763.20,250.61 847.60,250.51 932.00,248.24"/>
+<circle class="point" cx="88.00" cy="263.80" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="172.40" cy="290.21" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="256.80" cy="306.00" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="341.20" cy="279.96" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="425.60" cy="278.82" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="510.00" cy="251.34" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="594.40" cy="266.22" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="678.80" cy="253.68" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="763.20" cy="250.61" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="847.60" cy="250.51" r="3.5" fill="#9333ea"/>
+<circle class="point" cx="932.00" cy="248.24" r="3.5" fill="#9333ea"/>
+<polyline class="line" stroke="#dc2626" points="88.00,365.06 172.40,460.28 256.80,447.18 341.20,397.30 425.60,391.90 510.00,351.50 594.40,362.39 678.80,338.56 763.20,344.99 847.60,337.59 932.00,356.81"/>
+<circle class="point" cx="88.00" cy="365.06" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="172.40" cy="460.28" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="256.80" cy="447.18" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="341.20" cy="397.30" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="425.60" cy="391.90" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="510.00" cy="351.50" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="594.40" cy="362.39" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="678.80" cy="338.56" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="763.20" cy="344.99" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="847.60" cy="337.59" r="3.5" fill="#dc2626"/>
+<circle class="point" cx="932.00" cy="356.81" r="3.5" fill="#dc2626"/>
+<line x1="88" y1="78" x2="108" y2="78" stroke="#2563eb" stroke-width="3"/>
+<text class="legend" x="114" y="82">22.0M</text>
+<line x1="157" y1="78" x2="177" y2="78" stroke="#16a34a" stroke-width="3"/>
+<text class="legend" x="183" y="82">30.5M</text>
+<line x1="226" y1="78" x2="246" y2="78" stroke="#9333ea" stroke-width="3"/>
+<text class="legend" x="252" y="82">40.1M</text>
+<line x1="295" y1="78" x2="315" y2="78" stroke="#dc2626" stroke-width="3"/>
+<text class="legend" x="321" y="82">63.0M</text>
+<text class="tick" x="932" y="550" text-anchor="end">observed log values; no extrapolation</text>
+</svg>
