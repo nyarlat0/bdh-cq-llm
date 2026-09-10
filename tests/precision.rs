@@ -51,6 +51,26 @@ fn v100_size_sweep_configs_validate() {
 }
 
 #[test]
+fn v100_pilot_continuation_preserves_schedule() {
+    use bdh_cq_llm::pretrain::{PretrainConfig, TrainingSchedule};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cfg = PretrainConfig::from_path(root.join("configs/v100-22m-from-pilot.json")).unwrap();
+    let mut pilot = cfg.clone();
+    pilot.validation_batches = 384;
+    pilot.validation_every_steps = 256;
+    pilot.checkpoint_every_steps = 256;
+    pilot.log_every_steps = 16;
+    assert!(cfg.continuation_compatible_with(&pilot));
+    assert_eq!(cfg.memory.stateful_after_tokens, 0);
+    assert_eq!(cfg.memory.memory_read_ramp_tokens, 0);
+    assert_eq!(cfg.optimizer.micro_batch_size, 8);
+    assert_eq!(cfg.optimizer.gradient_accumulation, 8);
+    let schedule = TrainingSchedule::build(&cfg).unwrap();
+    assert_eq!(schedule.effective_tokens, 1_049_968_640);
+    assert_eq!(schedule.effective_tokens - 50_331_648, 999_636_992);
+}
+
+#[test]
 fn grouped_projection_matches_native_forward_and_both_gradients() {
     type B = Autodiff<NdArray<f32>>;
     let device = Default::default();
