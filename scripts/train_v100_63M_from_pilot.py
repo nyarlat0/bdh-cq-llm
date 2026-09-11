@@ -365,12 +365,7 @@ def main():
         CUDARC_CUDA_VERSION="12090",
     )
 
-    raise SystemExit(
-        subprocess.call(
-            cmd,
-            env=env,
-        )
-    )
+    os.execvpe(cmd[0], cmd, env)
 
 
 if __name__ == "__main__":
